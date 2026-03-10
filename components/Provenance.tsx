@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { History, Search, Code, FileText, Activity, Download, ShieldCheck, Fingerprint, Trash2, AlertOctagon, Filter, X, FlaskConical } from 'lucide-react';
+import { History, Search, Code, FileText, Activity, Download, ShieldCheck, Fingerprint, Trash2, AlertOctagon, Filter, X, FlaskConical, Map as MapIcon } from 'lucide-react';
 import { ProvenanceRecord, ProvenanceType } from '../types';
 
 interface ProvenanceProps {
@@ -131,12 +131,14 @@ export const Provenance: React.FC<ProvenanceProps> = ({ records }) => {
                   <td className="px-6 py-3">
                     <span className={`inline-flex items-center px-2 py-1 rounded text-xs font-medium ${
                       rec.actionType === ProvenanceType.ANALYSIS ? 'bg-purple-100 text-purple-700' :
+                      rec.actionType === ProvenanceType.MAPPING_SPEC ? 'bg-indigo-100 text-indigo-700' :
                       rec.actionType === ProvenanceType.TRANSFORMATION ? 'bg-green-100 text-green-700' :
                       rec.actionType === ProvenanceType.DELETION ? 'bg-red-100 text-red-700 border border-red-200' :
                       rec.actionType === ProvenanceType.SANDBOX_DISCARD ? 'bg-slate-200 text-slate-500' :
                       'bg-orange-100 text-orange-700'
                     }`}>
                       {rec.actionType === ProvenanceType.ANALYSIS && <Activity className="w-3 h-3 mr-1" />}
+                      {rec.actionType === ProvenanceType.MAPPING_SPEC && <MapIcon className="w-3 h-3 mr-1" />}
                       {rec.actionType === ProvenanceType.TRANSFORMATION && <Code className="w-3 h-3 mr-1" />}
                       {rec.actionType === ProvenanceType.INGESTION && <FileText className="w-3 h-3 mr-1" />}
                       {rec.actionType === ProvenanceType.DELETION && <Trash2 className="w-3 h-3 mr-1" />}

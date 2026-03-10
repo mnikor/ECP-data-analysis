@@ -1,0 +1,23 @@
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #eef2f5;
+  color: #18212b;
+  font-family: "Aptos", "Segoe UI", "Helvetica Neue", sans-serif;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+* {
+  box-sizing: border-box;
+}

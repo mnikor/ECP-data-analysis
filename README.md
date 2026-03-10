@@ -15,6 +15,14 @@ View your app in AI Studio: https://ai.studio/apps/e30ff1a0-27b6-4b3e-9145-c6708
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+2. Set the `GEMINI_API_KEY` in `.env.local` to your Gemini API key.
+   The key is now read by the local Node server only and is not injected into the browser bundle.
 3. Run the app:
    `npm run dev`
+
+## Production-style local run
+
+1. Build the frontend:
+   `npm run build`
+2. Start the integrated app/API server:
+   `npm run start`

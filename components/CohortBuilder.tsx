@@ -1,8 +1,9 @@
-import React, { useState, useMemo } from 'react';
-import { Filter, Play, Save, ChevronRight, Users, Funnel, Plus, Trash2, ArrowRight, Database, Code } from 'lucide-react';
+import React, { useState, useMemo, useEffect } from 'react';
+import { Filter, Play, Save, Users, Funnel, Plus, Trash2, Database, Code, Sparkles, Layers } from 'lucide-react';
 import { ClinicalFile, DataType, User, ProvenanceRecord, ProvenanceType, CohortFilter, AttritionStep } from '../types';
-import { generateCohortSQL } from '../services/geminiService';
+import { extractCohortFiltersFromProtocol, generateCohortSQL } from '../services/geminiService';
 import { Chart } from './Chart';
+import { CsvRow, matchesFilter, parseCsv, stringifyCsv } from '../utils/dataProcessing';
 
 interface CohortBuilderProps {
   files: ClinicalFile[];
@@ -13,21 +14,107 @@ interface CohortBuilderProps {
 
 export const CohortBuilder: React.FC<CohortBuilderProps> = ({ files, onAddFile, onRecordProvenance, currentUser }) => {
   const [selectedFileId, setSelectedFileId] = useState<string>('');
+  const [protocolFileId, setProtocolFileId] = useState<string>('');
   const [filters, setFilters] = useState<CohortFilter[]>([]);
   const [cohortName, setCohortName] = useState('');
   const [attritionData, setAttritionData] = useState<AttritionStep[]>([]);
   const [generatedSQL, setGeneratedSQL] = useState<string>('');
+  const [protocolNotes, setProtocolNotes] = useState<string[]>([]);
+  const [filteredResult, setFilteredResult] = useState<{ headers: string[]; rows: CsvRow[] } | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isApplyingProtocol, setIsApplyingProtocol] = useState(false);
+  const [isPreCohortedMode, setIsPreCohortedMode] = useState(false);
+  const [cohortColumn, setCohortColumn] = useState('');
+  const [selectedExistingCohortValue, setSelectedExistingCohortValue] = useState<string>('ALL');
   const [activeTab, setActiveTab] = useState<'FUNNEL' | 'SQL'>('FUNNEL');
 
-  const rawFiles = files.filter(f => f.type === DataType.RAW || f.type === DataType.STANDARDIZED);
-  const selectedFile = rawFiles.find(f => f.id === selectedFileId);
+  const sourceFiles = files.filter(
+    f => f.type === DataType.RAW || f.type === DataType.STANDARDIZED || f.type === DataType.COHORT_DEF
+  );
+  const docFiles = files.filter((f) => f.type === DataType.DOCUMENT);
+  const selectedFile = sourceFiles.find(f => f.id === selectedFileId);
+  const selectedProtocol = docFiles.find((d) => d.id === protocolFileId);
 
-  const columns = useMemo(() => {
-    if (!selectedFile || !selectedFile.content) return [];
-    const firstLine = selectedFile.content.split('\n')[0];
-    return firstLine.split(',').map(c => c.trim());
+  const parsedSelected = useMemo(() => {
+    if (!selectedFile || !selectedFile.content) return null;
+    try {
+      return parseCsv(selectedFile.content);
+    } catch {
+      return null;
+    }
   }, [selectedFile]);
+  const columns = parsedSelected?.headers || [];
+  const rows = parsedSelected?.rows || [];
+
+  const cohortCandidateColumns = useMemo(() => {
+    return columns.filter((col) => /(cohort|group|arm|strata|stratum|segment|population)/i.test(col));
+  }, [columns]);
+
+  const cohortValues = useMemo(() => {
+    if (!cohortColumn || rows.length === 0) return [];
+    return Array.from(new Set(rows.map((r) => (r[cohortColumn] || '').trim()).filter(Boolean))).sort();
+  }, [rows, cohortColumn]);
+
+  useEffect(() => {
+    if (cohortCandidateColumns.length > 0 && !cohortCandidateColumns.includes(cohortColumn)) {
+      setCohortColumn(cohortCandidateColumns[0]);
+    }
+    if (cohortCandidateColumns.length === 0) setCohortColumn('');
+    setSelectedExistingCohortValue('ALL');
+  }, [selectedFileId, cohortCandidateColumns, cohortColumn]);
+
+  const saveCohortFile = (
+    baseName: string,
+    headers: string[],
+    cohortRows: CsvRow[],
+    description: string,
+    metadata: Record<string, unknown>
+  ) => {
+    const cohortContent = stringifyCsv(headers, cohortRows);
+    const newFileId = crypto.randomUUID();
+    const finalCount = cohortRows.length;
+
+    const newFile: ClinicalFile = {
+      id: newFileId,
+      name: `${baseName.replace(/\s+/g, '_')}_N${finalCount}.csv`,
+      type: DataType.COHORT_DEF,
+      uploadDate: new Date().toISOString(),
+      size: `${(cohortContent.length / 1024).toFixed(1)} KB`,
+      content: cohortContent,
+      qcStatus: 'PASS',
+      metadata
+    };
+
+    onAddFile(newFile);
+    onRecordProvenance({
+      id: crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+      userId: currentUser.name,
+      userRole: currentUser.role,
+      actionType: ProvenanceType.COHORT_CREATION,
+      details: description,
+      inputs: [selectedFileId],
+      outputs: [newFileId]
+    });
+  };
+
+  const handleApplyProtocol = async () => {
+    if (!selectedProtocol || columns.length === 0) return;
+    setIsApplyingProtocol(true);
+    try {
+      const result = await extractCohortFiltersFromProtocol(selectedProtocol, columns);
+      setProtocolNotes(result.notes);
+      if (result.filters.length === 0) return;
+      setFilters((prev) => {
+        const merged = [...prev, ...result.filters];
+        return merged.filter(
+          (f, idx, arr) => arr.findIndex((x) => x.field === f.field && x.operator === f.operator && x.value === f.value) === idx
+        );
+      });
+    } finally {
+      setIsApplyingProtocol(false);
+    }
+  };
 
   const addFilter = () => {
     setFilters([...filters, {
@@ -47,50 +134,100 @@ export const CohortBuilder: React.FC<CohortBuilderProps> = ({ files, onAddFile, 
     setFilters(filters.map(f => f.id === id ? { ...f, [key]: val } : f));
   };
 
+  const handleRegisterExistingCohorts = () => {
+    if (!parsedSelected || !selectedFile) return;
+
+    if (cohortColumn && selectedExistingCohortValue === 'ALL') {
+      if (cohortValues.length === 0) {
+        alert('No cohort values found in selected column.');
+        return;
+      }
+      cohortValues.forEach((value) => {
+        const cohortRows = rows.filter((r) => (r[cohortColumn] || '').trim() === value);
+        const safeValue = value.replace(/[^a-zA-Z0-9_-]/g, '_');
+        saveCohortFile(
+          `${cohortName || selectedFile.name.replace(/\.[^/.]+$/, '')}_${safeValue}`,
+          columns,
+          cohortRows,
+          `Registered pre-defined cohort '${value}' from ${selectedFile.name} (N=${cohortRows.length}).`,
+          {
+            sourceType: 'PREDEFINED',
+            cohortColumn,
+            cohortValue: value,
+            sourceDataset: selectedFile.name
+          }
+        );
+      });
+      alert(`Registered ${cohortValues.length} predefined cohorts from column '${cohortColumn}'.`);
+      return;
+    }
+
+    const cohortRows =
+      cohortColumn && selectedExistingCohortValue !== 'ALL'
+        ? rows.filter((r) => (r[cohortColumn] || '').trim() === selectedExistingCohortValue)
+        : rows;
+    const defaultName =
+      cohortColumn && selectedExistingCohortValue !== 'ALL'
+        ? `${cohortName || selectedFile.name.replace(/\.[^/.]+$/, '')}_${selectedExistingCohortValue}`
+        : `${cohortName || selectedFile.name.replace(/\.[^/.]+$/, '')}_as_is`;
+
+    saveCohortFile(
+      defaultName,
+      columns,
+      cohortRows,
+      `Registered pre-defined cohort from ${selectedFile.name} (N=${cohortRows.length}).`,
+      {
+        sourceType: 'PREDEFINED',
+        cohortColumn: cohortColumn || null,
+        cohortValue: cohortColumn ? selectedExistingCohortValue : null,
+        sourceDataset: selectedFile.name
+      }
+    );
+    alert('Pre-defined cohort registered for analysis.');
+  };
+
   const handleRunCohort = async () => {
       if (!selectedFile || !selectedFile.content) return;
       setIsProcessing(true);
+      setFilteredResult(null);
 
-      // Generate SQL
-      const sql = await generateCohortSQL(selectedFile, filters);
-      setGeneratedSQL(sql);
+      try {
+        // Generate SQL
+        const sql = await generateCohortSQL(selectedFile, filters);
+        setGeneratedSQL(sql);
+        const { headers, rows } = parsedSelected || parseCsv(selectedFile.content);
+        const initialCount = rows.length;
+        let currentRows = rows;
+        const steps: AttritionStep[] = [];
 
-      // Simulate Processing Delay & Attrition Logic
-      await new Promise(r => setTimeout(r, 800));
+        steps.push({
+            stepName: 'Initial Population',
+            inputCount: initialCount,
+            excludedCount: 0,
+            remainingCount: initialCount,
+            reason: 'All records from source'
+        });
 
-      const rows = selectedFile.content.split('\n').slice(1);
-      const initialCount = rows.length;
-      let currentCount = initialCount;
-      const steps: AttritionStep[] = [];
+        filters.forEach((filter, idx) => {
+          const before = currentRows.length;
+          const afterRows = currentRows.filter((row) => matchesFilter(row, filter));
+          const excluded = before - afterRows.length;
 
-      // Create a mock funnel based on filters
-      // In a real app, this would execute pandas/SQL logic
-      steps.push({
-          stepName: 'Initial Population',
-          inputCount: initialCount,
-          excludedCount: 0,
-          remainingCount: initialCount,
-          reason: 'All records from source'
-      });
-
-      filters.forEach((filter, idx) => {
-          // Simulate exclusion (random logic for demo)
-          const excludeRate = 0.1 + (Math.random() * 0.2); // 10-30% attrition per step
-          const excluded = Math.floor(currentCount * excludeRate);
-          const remaining = currentCount - excluded;
-          
           steps.push({
               stepName: `Filter ${idx + 1}: ${filter.field} ${filter.operator} ${filter.value}`,
-              inputCount: currentCount,
+              inputCount: before,
               excludedCount: excluded,
-              remainingCount: remaining,
+              remainingCount: afterRows.length,
               reason: `Did not meet criteria: ${filter.description}`
           });
-          currentCount = remaining;
-      });
+          currentRows = afterRows;
+        });
 
-      setAttritionData(steps);
-      setIsProcessing(false);
+        setAttritionData(steps);
+        setFilteredResult({ headers, rows: currentRows });
+      } finally {
+        setIsProcessing(false);
+      }
   };
 
   const handleSaveCohort = () => {
@@ -102,32 +239,13 @@ export const CohortBuilder: React.FC<CohortBuilderProps> = ({ files, onAddFile, 
 
       const finalCount = attritionData[attritionData.length - 1].remainingCount;
       const description = `RWE Cohort '${cohortName}' (N=${finalCount}). Source: ${selectedFile?.name}`;
+      const resultHeaders = filteredResult?.headers || columns;
+      const resultRows = filteredResult?.rows || rows;
 
-      // 1. Create the Cohort File (Simulated filtered dataset)
-      const newFileId = crypto.randomUUID();
-      const newFile: ClinicalFile = {
-          id: newFileId,
-          name: `${cohortName.replace(/\s+/g, '_')}_N${finalCount}.csv`,
-          type: DataType.STANDARDIZED, // Ready for analysis
-          uploadDate: new Date().toISOString(),
-          size: 'Filtered',
-          content: selectedFile?.content, // In real app, this would be the filtered CSV
-          qcStatus: 'PASS',
-          metadata: { cohortFilters: filters }
-      };
-
-      onAddFile(newFile);
-
-      // 2. Log Provenance
-      onRecordProvenance({
-          id: crypto.randomUUID(),
-          timestamp: new Date().toISOString(),
-          userId: currentUser.name,
-          userRole: currentUser.role,
-          actionType: ProvenanceType.COHORT_CREATION,
-          details: description,
-          inputs: [selectedFileId],
-          outputs: [newFileId]
+      saveCohortFile(cohortName, resultHeaders, resultRows, description, {
+        sourceType: 'FILTERED',
+        cohortFilters: filters,
+        protocolFileId: protocolFileId || null,
       });
 
       alert("Cohort saved successfully! It is now available for Statistical Analysis.");
@@ -184,19 +302,103 @@ export const CohortBuilder: React.FC<CohortBuilderProps> = ({ files, onAddFile, 
                         className="w-full p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-purple-500 outline-none text-sm bg-slate-50"
                       >
                           <option value="">-- Select Real-World Dataset --</option>
-                          {rawFiles.map(f => (
+                          {sourceFiles.map(f => (
                               <option key={f.id} value={f.id}>{f.name} ({f.size})</option>
                           ))}
                       </select>
+                  </div>
+
+                  <div>
+                      <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">2. Protocol (Optional)</label>
+                      <select
+                        value={protocolFileId}
+                        onChange={(e) => setProtocolFileId(e.target.value)}
+                        className="w-full p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-purple-500 outline-none text-sm bg-slate-50"
+                      >
+                          <option value="">-- Select Protocol/SAP Document --</option>
+                          {docFiles.map((f) => (
+                              <option key={f.id} value={f.id}>{f.name}</option>
+                          ))}
+                      </select>
+                      <button
+                        onClick={handleApplyProtocol}
+                        disabled={!selectedProtocol || columns.length === 0 || isApplyingProtocol}
+                        className={`mt-2 w-full py-2 rounded text-xs font-bold flex items-center justify-center ${
+                          !selectedProtocol || columns.length === 0 || isApplyingProtocol
+                            ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                            : 'bg-indigo-600 text-white hover:bg-indigo-700'
+                        }`}
+                      >
+                        <Sparkles className="w-3 h-3 mr-2" />
+                        {isApplyingProtocol ? 'Extracting Criteria...' : 'Apply Protocol Criteria'}
+                      </button>
+                      {protocolNotes.length > 0 && (
+                        <div className="mt-2 p-2 border border-indigo-100 bg-indigo-50 rounded text-[11px] text-indigo-800">
+                          {protocolNotes.map((note, idx) => (
+                            <div key={idx}>- {note}</div>
+                          ))}
+                        </div>
+                      )}
+                  </div>
+
+                  <div className="pt-2 border-t border-slate-100">
+                    <label className="flex items-center space-x-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={isPreCohortedMode}
+                        onChange={(e) => setIsPreCohortedMode(e.target.checked)}
+                        className="rounded border-slate-300 text-purple-600 focus:ring-purple-500"
+                      />
+                      <span className="text-xs font-semibold text-slate-600 uppercase">Dataset Already Cohorted (Prospective NIS)</span>
+                    </label>
+                    {isPreCohortedMode && (
+                      <div className="mt-3 space-y-2">
+                        <label className="block text-xs font-semibold text-slate-500 uppercase">Cohort Column (Optional)</label>
+                        <select
+                          value={cohortColumn}
+                          onChange={(e) => setCohortColumn(e.target.value)}
+                          className="w-full p-2 border border-slate-300 rounded text-xs bg-slate-50"
+                        >
+                          <option value="">-- No Cohort Column (single provided cohort) --</option>
+                          {columns.map((c) => (
+                            <option key={c} value={c}>{c}</option>
+                          ))}
+                        </select>
+                        {cohortColumn && (
+                          <select
+                            value={selectedExistingCohortValue}
+                            onChange={(e) => setSelectedExistingCohortValue(e.target.value)}
+                            className="w-full p-2 border border-slate-300 rounded text-xs bg-slate-50"
+                          >
+                            <option value="ALL">All values (create one cohort per value)</option>
+                            {cohortValues.map((value) => (
+                              <option key={value} value={value}>{value}</option>
+                            ))}
+                          </select>
+                        )}
+                        <button
+                          onClick={handleRegisterExistingCohorts}
+                          disabled={!selectedFileId}
+                          className={`w-full py-2 rounded text-xs font-bold flex items-center justify-center ${
+                            !selectedFileId
+                              ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                              : 'bg-sky-600 text-white hover:bg-sky-700'
+                          }`}
+                        >
+                          <Layers className="w-3 h-3 mr-2" />
+                          Register Existing Cohort(s)
+                        </button>
+                      </div>
+                    )}
                   </div>
               </div>
 
               <div className="flex-1 overflow-y-auto mb-4">
                   <div className="flex justify-between items-center mb-2">
-                      <label className="block text-xs font-semibold text-slate-500 uppercase">2. Inclusion Criteria</label>
+                      <label className="block text-xs font-semibold text-slate-500 uppercase">3. Inclusion/Exclusion Criteria</label>
                       <button 
                         onClick={addFilter} 
-                        disabled={!selectedFileId}
+                        disabled={!selectedFileId || isPreCohortedMode}
                         className={`text-xs flex items-center font-bold transition-colors ${!selectedFileId ? 'text-slate-300 cursor-not-allowed' : 'text-purple-600 hover:text-purple-700'}`}
                       >
                           <Plus className="w-3 h-3 mr-1" /> Add Rule
@@ -204,6 +406,11 @@ export const CohortBuilder: React.FC<CohortBuilderProps> = ({ files, onAddFile, 
                   </div>
                   
                   <div className="space-y-3">
+                      {isPreCohortedMode && (
+                          <div className="text-center p-4 border-2 border-dashed border-sky-200 bg-sky-50 rounded-lg text-sky-700 text-xs">
+                              Pre-cohorted mode is active. Manual filters are optional and can be skipped.
+                          </div>
+                      )}
                       {filters.map((filter, idx) => (
                           <div key={filter.id} className="p-3 bg-slate-50 border border-slate-200 rounded-lg group">
                               <div className="flex justify-between mb-2">
@@ -229,6 +436,8 @@ export const CohortBuilder: React.FC<CohortBuilderProps> = ({ files, onAddFile, 
                                       <option value="NOT_EQUALS">!=</option>
                                       <option value="GREATER_THAN">&gt;</option>
                                       <option value="LESS_THAN">&lt;</option>
+                                      <option value="GREATER_OR_EQUAL">&gt;=</option>
+                                      <option value="LESS_OR_EQUAL">&lt;=</option>
                                       <option value="CONTAINS">Contains</option>
                                   </select>
                                   <input 
@@ -256,15 +465,15 @@ export const CohortBuilder: React.FC<CohortBuilderProps> = ({ files, onAddFile, 
 
               <button
                 onClick={handleRunCohort}
-                disabled={isProcessing || !selectedFileId}
+                disabled={isProcessing || !selectedFileId || isPreCohortedMode}
                 className={`w-full py-3 rounded-lg font-bold flex items-center justify-center shadow-md transition-all ${
-                    isProcessing || !selectedFileId
+                    isProcessing || !selectedFileId || isPreCohortedMode
                     ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
                     : 'bg-purple-600 text-white hover:bg-purple-700 hover:shadow-lg'
                 }`}
               >
                 {isProcessing ? <Play className="w-5 h-5 mr-2 animate-spin" /> : <Funnel className="w-5 h-5 mr-2" />}
-                {isProcessing ? 'Filtering Data...' : 'Run Filter Logic'}
+                {isProcessing ? 'Filtering Data...' : (isPreCohortedMode ? 'Use Register Existing Cohort(s)' : 'Run Filter Logic')}
               </button>
           </div>
 

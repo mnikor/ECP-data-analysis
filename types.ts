@@ -25,6 +25,7 @@ export enum UsageMode {
 
 export enum ProvenanceType {
   INGESTION = 'INGESTION',
+  MAPPING_SPEC = 'MAPPING_SPEC',
   TRANSFORMATION = 'TRANSFORMATION',
   ANALYSIS = 'ANALYSIS',
   STATISTICS = 'STATISTICS',
@@ -37,6 +38,7 @@ export enum ProvenanceType {
 
 export enum StatTestType {
   T_TEST = 'T-Test',
+  CHI_SQUARE = 'Chi-Square',
   ANOVA = 'ANOVA',
   REGRESSION = 'Linear Regression',
   CORRELATION = 'Correlation Analysis'
@@ -76,6 +78,8 @@ export interface User {
   name: string;
   role: UserRole;
   avatar?: string;
+  accessLabel?: string;
+  authProvider?: 'POC' | 'SSO';
 }
 
 export type QCStatus = 'PASS' | 'WARN' | 'FAIL' | 'PENDING';
@@ -84,6 +88,8 @@ export interface QCIssue {
   severity: 'HIGH' | 'MEDIUM' | 'LOW';
   description: string;
   affectedRows?: string; // e.g. "Row 4, 10" or "Column 'AGE'"
+  autoFixable?: boolean;
+  remediationHint?: string;
 }
 
 export interface CleaningSuggestion {
@@ -117,7 +123,7 @@ export interface MappingSpec {
 export interface CohortFilter {
   id: string;
   field: string;
-  operator: 'EQUALS' | 'NOT_EQUALS' | 'GREATER_THAN' | 'LESS_THAN' | 'CONTAINS';
+  operator: 'EQUALS' | 'NOT_EQUALS' | 'GREATER_THAN' | 'LESS_THAN' | 'GREATER_OR_EQUAL' | 'LESS_OR_EQUAL' | 'CONTAINS';
   value: string;
   description: string;
 }
@@ -157,6 +163,12 @@ export interface ChartConfiguration {
   layout: any;
 }
 
+export interface ResultTable {
+  title?: string;
+  columns: string[];
+  rows: Array<Record<string, string | number>>;
+}
+
 export interface AnalysisResponse {
   answer: string;
   chartConfig?: ChartConfiguration;
@@ -167,8 +179,100 @@ export interface StatAnalysisResult {
   metrics: Record<string, string | number>;
   interpretation: string;
   chartConfig: ChartConfiguration;
+  tableConfig?: ResultTable;
   executedCode: string;
   sasCode?: string; // NEW: Stores generated SAS code
+  aiCommentary?: {
+    source: 'AI' | 'FALLBACK';
+    summary: string;
+    limitations: string[];
+    caution?: string;
+  };
+}
+
+export type AutopilotExecutionMode = 'PACK' | 'SINGLE';
+export type AutopilotDataScope = 'SINGLE_DATASET' | 'LINKED_WORKSPACE';
+
+export interface AnalysisConcept {
+  label: string;
+  sourceColumn: string;
+  terms: string[];
+  matchCounts?: Record<string, number>;
+}
+
+export interface AnalysisPlanEntry {
+  id: string;
+  name: string;
+  testType: StatTestType;
+  var1: string;
+  var2: string;
+  covariates?: string[];
+  imputationMethod?: string;
+  applyPSM?: boolean;
+  rationale?: string;
+}
+
+export interface AutopilotMappingDecision {
+  sourceCol: string;
+  targetCol: string;
+  transformation?: string;
+  origin: 'REFERENCE' | 'AI' | 'IDENTITY';
+}
+
+export interface AutopilotReviewBundle {
+  workflow: {
+    usageMode: UsageMode;
+    rationale: string;
+    guardrails: string[];
+  };
+  qc: {
+    sourceFileName: string;
+    status: QCStatus;
+    issueCount: number;
+    autoFixableIssueCount: number;
+    blockingIssueCount: number;
+    autoFixSummary?: string;
+  };
+  mapping?: {
+    sourceDomain: string;
+    targetDomain: string;
+    mappedColumnCount: number;
+    transformedColumnCount: number;
+    decisions: AutopilotMappingDecision[];
+  };
+  protocol?: {
+    documentName: string;
+    extractedPlanCount: number;
+    notes: string[];
+    planItems: Array<{
+      name: string;
+      testType: StatTestType;
+      var1: string;
+      var2: string;
+    }>;
+  };
+  workspace?: {
+    joinKey: string;
+    sourceNames: string[];
+    skippedFiles: string[];
+    rowCount: number;
+    columnCount: number;
+    derivedColumns: string[];
+    notes: string[];
+    previewTable?: ResultTable;
+  };
+  analysisPlan: {
+    mode: AutopilotExecutionMode;
+    scope: AutopilotDataScope;
+    multiplicityMethod?: string;
+    tasks: Array<{
+      question: string;
+      testType: StatTestType;
+      var1: string;
+      var2: string;
+      rationale?: string;
+    }>;
+  };
 }
 
 export interface AnalysisSession extends StatAnalysisResult {
@@ -182,6 +286,31 @@ export interface AnalysisSession extends StatAnalysisResult {
     testType: StatTestType;
     var1: string;
     var2: string;
+    covariates?: string[];
+    imputationMethod?: string;
+    applyPSM?: boolean;
+    concept?: AnalysisConcept | null;
+    contextDocIds?: string[];
+    selectedPlanDocId?: string | null;
+    preSpecifiedPlan?: AnalysisPlanEntry[];
+    preSpecifiedPlanNotes?: string[];
+    enforcePreSpecifiedPlan?: boolean;
+    sourceWorkflow?: 'AUTOPILOT' | 'STATISTICS';
+    sourceSessionId?: string | null;
+    preSpecifiedPlanId?: string | null;
+    autopilotRunId?: string | null;
+    autopilotRunName?: string | null;
+    autopilotMode?: AutopilotExecutionMode | null;
+    autopilotSourceName?: string | null;
+    autopilotSourceNames?: string[] | null;
+    autopilotQuestion?: string | null;
+    autopilotResultIndex?: number | null;
+    autopilotDataScope?: AutopilotDataScope | null;
+    autopilotWorkspaceFileId?: string | null;
+    autopilotWorkspaceFileName?: string | null;
+    autopilotAdjustedPValue?: string | null;
+    autopilotMultiplicityMethod?: string | null;
+    autopilotReview?: AutopilotReviewBundle | null;
   };
 }
 

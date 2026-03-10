@@ -12,6 +12,7 @@ interface PipelineProps {
 }
 
 export const Pipeline: React.FC<PipelineProps> = ({ files, mappingSpecs, onAddFile, onRecordProvenance, currentUser }) => {
+  const signatureRequired = false; // Prototype mode: auth/signature deferred
   const [selectedSpecId, setSelectedSpecId] = useState<string>('');
   const [selectedFileId, setSelectedFileId] = useState<string>('');
   const [isRunning, setIsRunning] = useState(false);
@@ -35,40 +36,19 @@ export const Pipeline: React.FC<PipelineProps> = ({ files, mappingSpecs, onAddFi
     setExecutionLog(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${message}`]);
   };
 
-  const handleRunClick = async () => {
-      if (!selectedSpec || !selectedFile) return;
-      
-      // Step 1: Validation
-      setIsRunning(true);
-      setExecutionLog([]);
-      log(`Initiating Pipeline...`);
-      log(`Generating Validation Code...`);
-      
-      // Generate code first for review
-      const script = await generateETLScript(selectedFile, selectedSpec);
-      setGeneratedScript(script);
-      log(`Script generated. Pending review and signature.`);
-      
-      // GxP: Stop here. Open Signature Modal.
-      setIsRunning(false);
-      setShowSignModal(true);
-  };
-
-  const handleExecuteWithSignature = async () => {
-    if (signature !== currentUser.name) {
-        setSignError("Signature does not match your username.");
-        return;
-    }
-
+  const executeTransformation = async (signatureText?: string) => {
     if (!selectedSpec || !selectedFile) return;
 
-    setShowSignModal(false);
     setIsRunning(true);
     setResultFileId(null);
     setActiveTab('LOG');
 
-    log(`Digital Signature Verified: ${signature} (${currentUser.role})`);
-    log(`Executing script on data (Gemini Engine)...`);
+    if (signatureText) {
+      log(`Digital Signature Verified: ${signatureText}`);
+    } else {
+      log(`Prototype mode active: digital signature deferred.`);
+    }
+    log(`Executing transformation on data (deterministic engine)...`);
 
     try {
       // Step 3: Transformation (Execution via Script)
@@ -91,8 +71,7 @@ export const Pipeline: React.FC<PipelineProps> = ({ files, mappingSpecs, onAddFi
           type: DataType.STANDARDIZED,
           uploadDate: new Date().toISOString(),
           size: `${(transformedCsv.length / 1024).toFixed(1)} KB`,
-          content: transformedCsv,
-          qcStatus: 'PENDING'
+          content: transformedCsv
       };
 
       onAddFile(newFile);
@@ -108,7 +87,7 @@ export const Pipeline: React.FC<PipelineProps> = ({ files, mappingSpecs, onAddFi
         details: `Transformed ${selectedFile.name} to ${selectedSpec.targetDomain}`,
         inputs: [selectedFile.id, selectedSpec.id],
         outputs: [newFileId],
-        signature: `Electronically Signed by ${currentUser.name} at ${new Date().toISOString()}`
+        signature: signatureText || 'Deferred (prototype mode)'
       });
 
       log(`Pipeline completed successfully.`);
@@ -119,6 +98,37 @@ export const Pipeline: React.FC<PipelineProps> = ({ files, mappingSpecs, onAddFi
     } finally {
       setIsRunning(false);
     }
+  };
+
+  const handleRunClick = async () => {
+      if (!selectedSpec || !selectedFile) return;
+      
+      setIsRunning(true);
+      setExecutionLog([]);
+      log(`Initiating Pipeline...`);
+      log(`Generating Validation Code...`);
+      
+      const script = await generateETLScript(selectedFile, selectedSpec);
+      setGeneratedScript(script);
+      log(`Script generated.`);
+      setIsRunning(false);
+
+      if (signatureRequired) {
+        log(`Pending review and signature.`);
+        setShowSignModal(true);
+        return;
+      }
+
+      await executeTransformation();
+  };
+
+  const handleExecuteWithSignature = async () => {
+    if (signature !== currentUser.name) {
+        setSignError("Signature does not match your username.");
+        return;
+    }
+    setShowSignModal(false);
+    await executeTransformation(`Electronically Signed by ${currentUser.name} (${currentUser.role}) at ${new Date().toISOString()}`);
   };
 
   const downloadResult = () => {
@@ -209,8 +219,13 @@ export const Pipeline: React.FC<PipelineProps> = ({ files, mappingSpecs, onAddFi
                     }`}
                     >
                     {isRunning ? <Clock className="w-5 h-5 mr-2 animate-spin" /> : <Play className="w-5 h-5 mr-2" />}
-                    {isRunning ? 'Running Transformation...' : 'Review & Run'}
+                    {isRunning ? 'Running Transformation...' : (signatureRequired ? 'Review & Run' : 'Review & Run (Prototype)')}
                   </button>
+                  {!signatureRequired && (
+                    <p className="text-[11px] text-slate-500 mt-2">
+                      Prototype mode: digital signature enforcement is deferred for capability testing.
+                    </p>
+                  )}
               </div>
 
               {/* Spec Preview */}
@@ -315,7 +330,7 @@ export const Pipeline: React.FC<PipelineProps> = ({ files, mappingSpecs, onAddFi
       </div>
 
       {/* Signature Modal */}
-      {showSignModal && (
+      {signatureRequired && showSignModal && (
           <div className="absolute inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
               <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-8 animate-fadeIn">
                   <div className="flex justify-between items-start mb-6">

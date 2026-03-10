@@ -1,5 +1,5 @@
 {
-  "name": "ClinicalInsights AI",
-  "description": "An LLM-powered clinical data analysis tool supporting raw programming, mapping, RAG/Stuffing analysis, and full provenance tracking.",
+  "name": "Evidence CoPilot",
+  "description": "An AI-assisted evidence workflow platform supporting ingestion, mapping, exploratory insight generation, and controlled statistical analysis.",
   "requestFramePermissions": []
 }

@@ -2,6 +2,8 @@ import React, { useState, useMemo } from 'react';
 import { ArrowRight, Wand2, Save, FileSpreadsheet, AlertCircle } from 'lucide-react';
 import { MappingSpec, ClinicalFile, DataType } from '../types';
 import { generateMappingSuggestion } from '../services/geminiService';
+import { parseCsv } from '../utils/dataProcessing';
+import { parseReferenceMapping } from '../utils/mappingReference';
 
 interface MappingProps {
   files: ClinicalFile[];
@@ -10,6 +12,7 @@ interface MappingProps {
 
 export const Mapping: React.FC<MappingProps> = ({ files, onSaveSpec }) => {
   const [selectedFileId, setSelectedFileId] = useState<string>('');
+  const [selectedReferenceId, setSelectedReferenceId] = useState<string>('');
   const [sourceDomain, setSourceDomain] = useState('RAW_DOMAIN');
   const [targetDomain, setTargetDomain] = useState('DM');
   const [mappings, setMappings] = useState<{ sourceCol: string; targetCol: string; transformation?: string }[]>([
@@ -18,15 +21,18 @@ export const Mapping: React.FC<MappingProps> = ({ files, onSaveSpec }) => {
   const [isSuggesting, setIsSuggesting] = useState(false);
 
   const rawFiles = files.filter(f => f.type === DataType.RAW);
+  const referenceFiles = files.filter(f => f.type === DataType.MAPPING);
   const selectedFile = rawFiles.find(f => f.id === selectedFileId);
+  const selectedReference = referenceFiles.find(f => f.id === selectedReferenceId);
 
   // Parse columns from the selected file content
   const sourceColumns = useMemo(() => {
     if (!selectedFile || !selectedFile.content) return [];
-    // Get first line
-    const headerLine = selectedFile.content.split('\n')[0];
-    if (!headerLine) return [];
-    return headerLine.split(',').map(c => c.trim());
+    try {
+      return parseCsv(selectedFile.content).headers;
+    } catch {
+      return [];
+    }
   }, [selectedFile]);
 
   // Update Source Domain Name automatically when file is selected
@@ -100,6 +106,34 @@ export const Mapping: React.FC<MappingProps> = ({ files, onSaveSpec }) => {
     alert("Mapping Specification Saved Successfully!");
   };
 
+  const handleLoadReference = () => {
+    if (!selectedReference) {
+      alert('Select a reference mapping file first.');
+      return;
+    }
+
+    const imported = parseReferenceMapping(selectedReference);
+    if (!imported) {
+      alert('Could not parse reference mapping file. Expected JSON with mappings[] or CSV with source/target columns.');
+      return;
+    }
+
+    setSourceDomain(imported.sourceDomain || sourceDomain);
+    setTargetDomain(imported.targetDomain || targetDomain);
+    setMappings(imported.mappings.length > 0 ? imported.mappings : mappings);
+    if (imported.mode === 'IDENTITY') {
+      alert(
+        `Loaded ${imported.mappings.length} rows from ${selectedReference.name} using dictionary bootstrap (${imported.sourceHeader} -> same target). Review targets and click Save Spec.`
+      );
+      return;
+    }
+    alert(
+      `Loaded ${imported.mappings.length} mapping rows from ${selectedReference.name}${
+        imported.sourceHeader && imported.targetHeader ? ` (${imported.sourceHeader} -> ${imported.targetHeader})` : ''
+      }. Review and click Save Spec.`
+    );
+  };
+
   return (
     <div className="p-6 max-w-5xl mx-auto h-full overflow-y-auto">
       <div className="flex justify-between items-center mb-6">
@@ -133,6 +167,39 @@ export const Mapping: React.FC<MappingProps> = ({ files, onSaveSpec }) => {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
           {/* Configuration Panel */}
           <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">0. Import Reference Mapping (Optional)</label>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                    <select
+                        value={selectedReferenceId}
+                        onChange={(e) => setSelectedReferenceId(e.target.value)}
+                        className="md:col-span-2 p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-medical-500 outline-none bg-slate-50 text-sm"
+                    >
+                        <option value="">-- Choose Reference File --</option>
+                        {referenceFiles.map((f) => (
+                            <option key={f.id} value={f.id}>{f.name}</option>
+                        ))}
+                    </select>
+                    <button
+                        onClick={handleLoadReference}
+                        disabled={!selectedReferenceId}
+                        className={`px-3 py-2 rounded-lg text-sm font-medium ${
+                            !selectedReferenceId
+                              ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                              : 'bg-indigo-600 text-white hover:bg-indigo-700'
+                        }`}
+                    >
+                        Load Reference
+                    </button>
+                </div>
+                {referenceFiles.length === 0 && (
+                    <div className="flex items-center mt-2 text-xs text-slate-500 bg-slate-50 p-2 rounded border border-slate-200">
+                        <AlertCircle className="w-3 h-3 mr-1" />
+                        No reference files found. Upload them in Ingestion &gt; Reference.
+                    </div>
+                )}
+              </div>
+
               <div>
                 <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">1. Select Source File</label>
                 <div className="relative">
