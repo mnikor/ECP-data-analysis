@@ -28,7 +28,8 @@ flowchart LR
     FE --> API["Node Backend /api/ai/generate"]
     FE --> PAPI["Node Backend /api/projects"]
     API --> LLM["LLM Provider"]
-    PAPI --> LDS["Local Disk Project Store (.app-data/projects.json)"]
+    PAPI --> META["Local Metadata Store (.app-data/projects.metadata.json)"]
+    PAPI --> ART["Local File Artifact Store (.app-data/file-artifacts/)"]
     FE --> EXP["HTML Exports"]
 ```
 
@@ -37,7 +38,8 @@ Current implementation notes:
 - The frontend also calls the backend for project persistence.
 - The backend currently uses Google Gemini in `server/index.js`.
 - Deterministic statistics are executed locally in app logic, not by the model.
-- Project state is currently stored on local disk through the backend project store.
+- Project metadata is currently stored on local disk through the backend metadata store.
+- File payloads are currently stored separately on local disk through the backend artifact store.
 - Legacy browser IndexedDB/localStorage state is migrated forward on first load when available.
 
 ## Working Status
@@ -48,6 +50,7 @@ Current implementation notes:
 - Evidence CoPilot frontend and integrated Node backend
 - backend AI proxy pattern
 - backend-backed local project persistence
+- split local metadata and file-artifact persistence
 - ingestion, QC, mapping, Autopilot, Statistical Analysis, AI Chat
 - deterministic statistical execution
 - HTML report export
@@ -66,6 +69,7 @@ Current implementation notes:
 
 These areas are prepared architecturally but not fully wired to real enterprise services yet:
 - the app already uses backend endpoints rather than browser-only storage
+- project metadata and uploaded file payloads are already separated behind the backend boundary
 - AI calls already flow through a backend boundary
 - access control is centralized and can be reconnected to SSO later
 - storage and provider swaps can happen server-side without redesigning the frontend
@@ -75,7 +79,7 @@ These areas are prepared architecturally but not fully wired to real enterprise 
 - `/components` UI modules
 - `/services/geminiService.ts` frontend service layer for AI and deterministic workflows
 - `/server/index.js` integrated backend server and AI proxy
-- `/server/projectStore.js` local disk-backed project persistence adapter
+- `/server/projectStore.js` local disk-backed metadata and artifact persistence adapter
 - `/utils/statisticsEngine.ts` deterministic analysis execution
 - `/utils/projectStorage.ts` frontend project persistence client and legacy migration helpers
 - `/public` static assets including the Evidence CoPilot logo
@@ -130,16 +134,18 @@ A colleague can reproduce:
 - UI behavior
 - AI proxy pattern
 - backend-backed local persistence behavior
+- split metadata/file payload persistence behavior
 - deterministic analytics behavior
 - export/report generation
 
 A colleague cannot reproduce automatically:
-- your local `.app-data/projects.json`
+- your local `.app-data/projects.metadata.json`
+- your local `.app-data/file-artifacts/`
 - uploaded source files
 - local `.env.local`
 - your saved chat history and runs
 
-For shared testing, import the same datasets and recreate the same environment variables. If you want to share the exact local project state, you must also transfer the local backend persistence file under `.app-data/`.
+For shared testing, import the same datasets and recreate the same environment variables. If you want to share the exact local project state, you must also transfer the local backend persistence files under `.app-data/`.
 
 ## POC vs Enterprise
 
@@ -157,6 +163,7 @@ POC characteristics:
 What is already better than the earlier prototype:
 - project state is no longer browser-only
 - the frontend already depends on backend APIs for both AI and project persistence
+- project metadata and uploaded file payloads are no longer coupled into one monolithic browser or server blob
 - this makes the enterprise migration path cleaner
 
 ### Enterprise target state
@@ -205,8 +212,8 @@ Move the following server-side for enterprise use:
 
 ### Data persistence
 
-Replace the current local disk project store with managed backend persistence:
-- `S3` for uploaded raw files, standardized files, generated exports
+Replace the current local metadata and artifact stores with managed backend persistence:
+- `S3` for uploaded raw files, standardized files, generated exports, and other binary/artifact payloads
 - `RDS PostgreSQL` for:
   - projects
   - file metadata

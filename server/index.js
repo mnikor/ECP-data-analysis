@@ -116,6 +116,8 @@ const handleProjects = async (req, res) => {
       sendJson(res, 200, {
         projects,
         storageBackend: projectStore.backend,
+        metadataBackend: projectStore.metadataBackend,
+        artifactBackend: projectStore.artifactBackend,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to load projects.';
@@ -139,6 +141,8 @@ const handleProjects = async (req, res) => {
         ok: true,
         projectCount: projects.length,
         storageBackend: projectStore.backend,
+        metadataBackend: projectStore.metadataBackend,
+        artifactBackend: projectStore.artifactBackend,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to save projects.';
@@ -151,7 +155,12 @@ const handleProjects = async (req, res) => {
   if (req.method === 'DELETE') {
     try {
       await projectStore.clearProjects();
-      sendJson(res, 200, { ok: true, storageBackend: projectStore.backend });
+      sendJson(res, 200, {
+        ok: true,
+        storageBackend: projectStore.backend,
+        metadataBackend: projectStore.metadataBackend,
+        artifactBackend: projectStore.artifactBackend,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to clear projects.';
       console.error('Project store clear error', error);
@@ -212,6 +221,8 @@ const start = async () => {
         ok: true,
         aiConfigured: Boolean(process.env.GEMINI_API_KEY),
         projectStoreBackend: projectStore.backend,
+        metadataStoreBackend: projectStore.metadataBackend,
+        artifactStoreBackend: projectStore.artifactBackend,
       });
       return;
     }
