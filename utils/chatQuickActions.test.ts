@@ -47,4 +47,21 @@ describe('chatQuickActions', () => {
     const actions = buildChatQuickActions([protocol, dm], [protocol, dm]);
     expect(actions.map((action) => action.id)).toContain('protocol');
   });
+
+  it('returns ADaM-aware prompts for ADSL and ADTTE datasets', () => {
+    const adsl = makeFile({
+      name: 'adsl.csv',
+      type: DataType.STANDARDIZED,
+      content: 'USUBJID,TRT01A,AGE,SEX,ITTFL\n01,DrugA,65,M,Y',
+    });
+    const adtte = makeFile({
+      name: 'adtte.csv',
+      type: DataType.STANDARDIZED,
+      content: 'USUBJID,PARAMCD,PARAM,AVAL,CNSR,TRT01A\n01,OS,Overall Survival,12,0,DrugA',
+    });
+
+    const actions = buildChatQuickActions([adsl, adtte], [adsl, adtte]);
+    expect(actions.map((action) => action.id)).toContain('analysis-set');
+    expect(actions.map((action) => action.id)).toContain('time-to-event');
+  });
 });

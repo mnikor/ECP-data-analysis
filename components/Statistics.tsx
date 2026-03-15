@@ -91,6 +91,145 @@ const buildPlotMarkup = (chartConfig: StatAnalysisResult['chartConfig'], plotId:
   `;
 };
 
+const normalizeFieldKey = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+const toNumber = (value?: string | null): number | null => {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const countDistinctNonEmpty = (values: string[]) => new Set(values.map((value) => value.trim()).filter(Boolean)).size;
+
+const isLikelyIdentifierColumn = (rows: Record<string, string>[], column: string): boolean => {
+  const sample = rows.slice(0, 300).map((row) => (row[column] || '').trim()).filter(Boolean);
+  if (sample.length === 0) return false;
+  const distinct = new Set(sample);
+  if (distinct.size >= Math.floor(sample.length * 0.95)) return true;
+  const normalized = normalizeFieldKey(column);
+  return ['usubjid', 'subjid', 'subjectid', 'subjectnum', 'recordid'].some((hint) => normalized.includes(hint));
+};
+
+const isLikelyNumericColumn = (rows: Record<string, string>[], column: string): boolean => {
+  const sample = rows.slice(0, 300).map((row) => (row[column] || '').trim()).filter(Boolean);
+  if (sample.length === 0) return false;
+  const numericCount = sample.filter((value) => toNumber(value) != null).length;
+  return numericCount >= Math.max(3, Math.floor(sample.length * 0.75));
+};
+
+const parseEventObserved = (rawValue: string, censorColumn: string): boolean | null => {
+  const value = rawValue.trim().toLowerCase();
+  if (!value) return null;
+
+  const usesCensorCoding = /cnsr|censor/.test(censorColumn.toLowerCase());
+
+  if (['0', '0.0', 'n', 'no', 'false'].includes(value)) return usesCensorCoding ? true : false;
+  if (['1', '1.0', 'y', 'yes', 'true'].includes(value)) return usesCensorCoding ? false : true;
+  if (['event', 'death', 'dead', 'progressed', 'progression', 'failure'].some((token) => value.includes(token))) {
+    return true;
+  }
+  if (['censored', 'alive', 'ongoing', 'no event'].some((token) => value.includes(token))) {
+    return false;
+  }
+
+  return null;
+};
+
+type SurvivalPreflight = {
+  recommendedGroupVar: string | null;
+  recommendedTimeVar: string | null;
+  censorColumn: string | null;
+  recommendedValidRows: number;
+  currentValidRows: number;
+  recommendedGroupCount: number;
+  currentGroupCount: number;
+};
+
+const SURVIVAL_GROUP_HINTS = ['TRT01A', 'TRTA', 'TRT01P', 'ACTARM', 'ARM', 'TREATMENT_ARM', 'TRT_ARM'];
+const SURVIVAL_TIME_HINTS = ['AVAL', 'TIME', 'OS', 'PFS', 'TTE', 'DURATION', 'DAY', 'MONTH'];
+const SURVIVAL_CENSOR_HINTS = ['CNSR', 'CENSOR', 'CENSORING', 'EVENT', 'EVENTFL', 'STATUS', 'DEATH', 'DEATHFL'];
+
+const chooseHeaderByHints = (headers: string[], hints: string[]): string | null => {
+  const normalizedHeaders = headers.map((header) => ({
+    raw: header,
+    normalized: normalizeFieldKey(header),
+  }));
+
+  for (const hint of hints) {
+    const normalizedHint = normalizeFieldKey(hint);
+    const exact = normalizedHeaders.find((header) => header.normalized === normalizedHint);
+    if (exact) return exact.raw;
+    const partial = normalizedHeaders.find((header) => header.normalized.includes(normalizedHint));
+    if (partial) return partial.raw;
+  }
+
+  return null;
+};
+
+const countValidSurvivalRows = (
+  rows: Record<string, string>[],
+  groupVar: string | null,
+  timeVar: string | null,
+  censorColumn: string | null
+) => {
+  if (!groupVar || !timeVar || !censorColumn) return 0;
+  return rows.reduce((count, row) => {
+    const group = (row[groupVar] || '').trim();
+    const time = toNumber(row[timeVar]);
+    const eventObserved = parseEventObserved(row[censorColumn] || '', censorColumn);
+    return group && time != null && time >= 0 && eventObserved != null ? count + 1 : count;
+  }, 0);
+};
+
+const buildSurvivalPreflight = (
+  headers: string[],
+  rows: Record<string, string>[],
+  currentGroupVar: string,
+  currentTimeVar: string
+): SurvivalPreflight | null => {
+  if (headers.length === 0 || rows.length === 0) return null;
+
+  const censorColumn = chooseHeaderByHints(headers, SURVIVAL_CENSOR_HINTS);
+  const categoricalCandidates = headers.filter((header) => {
+    if (header === currentTimeVar) return false;
+    if (isLikelyIdentifierColumn(rows, header)) return false;
+    if (isLikelyNumericColumn(rows, header)) return false;
+    const distinct = countDistinctNonEmpty(rows.map((row) => row[header] || ''));
+    return distinct >= 2 && distinct <= 12;
+  });
+  const numericCandidates = headers.filter((header) => {
+    if (header === currentGroupVar) return false;
+    if (isLikelyIdentifierColumn(rows, header)) return false;
+    return isLikelyNumericColumn(rows, header);
+  });
+
+  const recommendedGroupVar =
+    chooseHeaderByHints(categoricalCandidates, SURVIVAL_GROUP_HINTS) || categoricalCandidates[0] || null;
+  const recommendedTimeVar =
+    chooseHeaderByHints(numericCandidates, SURVIVAL_TIME_HINTS) || numericCandidates[0] || null;
+
+  const recommendedValidRows = countValidSurvivalRows(rows, recommendedGroupVar, recommendedTimeVar, censorColumn);
+  const currentValidRows = countValidSurvivalRows(rows, currentGroupVar || null, currentTimeVar || null, censorColumn);
+  const recommendedGroupCount = recommendedGroupVar
+    ? countDistinctNonEmpty(rows.map((row) => row[recommendedGroupVar] || ''))
+    : 0;
+  const currentGroupCount = currentGroupVar
+    ? countDistinctNonEmpty(rows.map((row) => row[currentGroupVar] || ''))
+    : 0;
+
+  return {
+    recommendedGroupVar,
+    recommendedTimeVar,
+    censorColumn,
+    recommendedValidRows,
+    currentValidRows,
+    recommendedGroupCount,
+    currentGroupCount,
+  };
+};
+
 export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenance, sessions, setSessions, activeSessionId, setActiveSessionId, currentUser, studyType }) => {
   // Wizard State (for 'NEW' session)
   const [step, setStep] = useState<StatAnalysisStep>(StatAnalysisStep.CONFIGURATION);
@@ -142,6 +281,14 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
   const selectedFile = rawFiles.find(f => f.id === selectedFileId);
   const selectedPlanDoc = docFiles.find(d => d.id === selectedPlanDocId);
   const canRunAnalysis = Boolean(selectedFile && generatedCode.trim());
+  const selectedFileData = useMemo(() => {
+    if (!selectedFile?.content) return { headers: [] as string[], rows: [] as Record<string, string>[] };
+    try {
+      return parseCsv(selectedFile.content);
+    } catch {
+      return { headers: [] as string[], rows: [] as Record<string, string>[] };
+    }
+  }, [selectedFile]);
 
   const buildPlanEntriesFromReview = (session: AnalysisSession): AnalysisPlanEntry[] => {
     if (session.params.preSpecifiedPlan && session.params.preSpecifiedPlan.length > 0) {
@@ -467,14 +614,11 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
     downloadHtmlReport(fileName, buildStatisticalReportHtml());
   };
 
-  const availableColumns = useMemo(() => {
-    if (!selectedFile || !selectedFile.content) return [];
-    try {
-      return parseCsv(selectedFile.content).headers;
-    } catch {
-      return [];
-    }
-  }, [selectedFile]);
+  const availableColumns = useMemo(() => selectedFileData.headers, [selectedFileData]);
+  const survivalPreflight = useMemo(() => {
+    if (testType !== StatTestType.KAPLAN_MEIER && testType !== StatTestType.COX_PH) return null;
+    return buildSurvivalPreflight(selectedFileData.headers, selectedFileData.rows, variable1, variable2);
+  }, [selectedFileData, testType, variable1, variable2]);
 
   const toggleContextDoc = (id: string) => {
     const newSet = new Set(selectedContextIds);
@@ -611,6 +755,18 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
     });
   }
 
+  const applyDetectedSurvivalSetup = () => {
+    if (!survivalPreflight?.recommendedGroupVar || !survivalPreflight.recommendedTimeVar) return;
+    setVariable1(survivalPreflight.recommendedGroupVar);
+    setVariable2(survivalPreflight.recommendedTimeVar);
+    setAnalysisConcept(null);
+    setActivePlanId(null);
+    setWizardExplanation(
+      `Detected survival-ready setup: group ${survivalPreflight.recommendedGroupVar}, time ${survivalPreflight.recommendedTimeVar}, censoring ${survivalPreflight.censorColumn || 'not found'}.`
+    );
+    setErrorMsg(null);
+  };
+
   const confirmedBlockingReason = useMemo(() => {
     if (usageMode !== UsageMode.OFFICIAL) return null;
     if (!selectedPlanDoc) return 'Run Confirmed requires a selected Protocol or SAP document.';
@@ -636,7 +792,34 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
   ]);
 
   const handleGenerateCode = async () => {
-    if (!selectedFile || !variable1 || !variable2 || availableColumns.length === 0) {
+    if (!selectedFile || availableColumns.length === 0) {
+      setErrorMsg("Please select a valid file and both analysis variables.");
+      return;
+    }
+    let effectiveVar1 = variable1;
+    let effectiveVar2 = variable2;
+    if (testType === StatTestType.KAPLAN_MEIER || testType === StatTestType.COX_PH) {
+      if (survivalPreflight?.recommendedValidRows && survivalPreflight.recommendedValidRows >= 3) {
+        const selectionLooksInvalid =
+          !effectiveVar1 ||
+          !effectiveVar2 ||
+          survivalPreflight.currentValidRows < 3 ||
+          survivalPreflight.currentGroupCount < 2;
+        if (selectionLooksInvalid && survivalPreflight.recommendedGroupVar && survivalPreflight.recommendedTimeVar) {
+          effectiveVar1 = survivalPreflight.recommendedGroupVar;
+          effectiveVar2 = survivalPreflight.recommendedTimeVar;
+          setVariable1(effectiveVar1);
+          setVariable2(effectiveVar2);
+          setWizardExplanation(
+            `Auto-corrected the survival configuration to use ${effectiveVar1} as the group and ${effectiveVar2} as the time variable with censoring from ${survivalPreflight.censorColumn}.`
+          );
+        }
+      }
+      if (!effectiveVar1 || !effectiveVar2) {
+        setErrorMsg('Select a survival group and time variable, or use the detected survival setup.');
+        return;
+      }
+    } else if (!effectiveVar1 || !effectiveVar2) {
       setErrorMsg("Please select a valid file and both analysis variables.");
       return;
     }
@@ -658,7 +841,7 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
     try {
       const contextDocs = docFiles.filter(d => selectedContextIds.has(d.id));
       const code = await Promise.race([
-          generateStatisticalCode(selectedFile, testType, variable1, variable2, contextDocs, covariates, imputationMethod, applyPSM),
+          generateStatisticalCode(selectedFile, testType, effectiveVar1, effectiveVar2, contextDocs, covariates, imputationMethod, applyPSM),
           timeoutPromise
       ]);
       setGeneratedCode(code);
@@ -710,6 +893,24 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
     if (enforcePreSpecifiedPlan && preSpecifiedPlan.length > 0 && !doesCurrentConfigMatchPlan()) {
       setErrorMsg('Execution blocked: configuration does not match extracted pre-specified analysis plan.');
       return;
+    }
+    if (testType === StatTestType.KAPLAN_MEIER || testType === StatTestType.COX_PH) {
+      const needsCorrection =
+        !variable1 ||
+        !variable2 ||
+        (survivalPreflight && (survivalPreflight.currentValidRows < 3 || survivalPreflight.currentGroupCount < 2));
+      if (needsCorrection && survivalPreflight?.recommendedValidRows && survivalPreflight.recommendedValidRows >= 3 && survivalPreflight.recommendedGroupVar && survivalPreflight.recommendedTimeVar) {
+        setVariable1(survivalPreflight.recommendedGroupVar);
+        setVariable2(survivalPreflight.recommendedTimeVar);
+        setWizardExplanation(
+          `Detected survival-ready setup: ${survivalPreflight.recommendedGroupVar} as group, ${survivalPreflight.recommendedTimeVar} as time, censoring from ${survivalPreflight.censorColumn}. Regenerate code before execution so the preview matches the executed analysis.`
+        );
+        setErrorMsg(
+          `Updated the survival variables to ${survivalPreflight.recommendedGroupVar} and ${survivalPreflight.recommendedTimeVar}. Regenerate code before running the analysis.`
+        );
+        setStep(StatAnalysisStep.CONFIGURATION);
+        return;
+      }
     }
     setIsRunning(true);
     
@@ -1079,7 +1280,11 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                                </select>
                             </div>
                             <div>
-                               <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Variable 1 (Group/X)</label>
+                               <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">
+                                 {testType === StatTestType.KAPLAN_MEIER || testType === StatTestType.COX_PH
+                                   ? 'Variable 1 (Group/Covariate)'
+                                   : 'Variable 1 (Group/X)'}
+                               </label>
                                <select 
                                  value={variable1}
                                  onChange={(e) => {
@@ -1095,7 +1300,11 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                             </div>
                             <div>
                                <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">
-                                 {testType === StatTestType.CHI_SQUARE ? 'Variable 2 (Outcome/Event Column)' : 'Variable 2 (Outcome/Y)'}
+                                 {testType === StatTestType.CHI_SQUARE
+                                   ? 'Variable 2 (Outcome/Event Column)'
+                                   : testType === StatTestType.KAPLAN_MEIER || testType === StatTestType.COX_PH
+                                     ? 'Variable 2 (Time Variable)'
+                                     : 'Variable 2 (Outcome/Y)'}
                                </label>
                                <select 
                                  value={variable2}
@@ -1109,8 +1318,58 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                                  <option value="">- Select -</option>
                                  {availableColumns.map(c => <option key={c} value={c}>{c}</option>)}
                                </select>
+                               {(testType === StatTestType.KAPLAN_MEIER || testType === StatTestType.COX_PH) && (
+                                 <p className="mt-1 text-[10px] text-slate-500">
+                                   Censoring is auto-detected from columns like <span className="font-semibold">CNSR</span>, <span className="font-semibold">STATUS</span>, or <span className="font-semibold">EVENT</span>.
+                                 </p>
+                               )}
                             </div>
                          </div>
+
+                         {(testType === StatTestType.KAPLAN_MEIER || testType === StatTestType.COX_PH) && survivalPreflight && (
+                           <div
+                             className={`mt-4 rounded-lg border p-3 ${
+                               survivalPreflight.recommendedValidRows >= 3 && survivalPreflight.recommendedGroupCount >= 2
+                                 ? survivalPreflight.currentValidRows >= 3 && survivalPreflight.currentGroupCount >= 2
+                                   ? 'border-emerald-200 bg-emerald-50'
+                                   : 'border-amber-200 bg-amber-50'
+                                 : 'border-red-200 bg-red-50'
+                             }`}
+                           >
+                             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                               <div className="text-sm">
+                                 <div className="font-semibold text-slate-800">Detected survival setup</div>
+                                 <div className="mt-1 text-slate-700">
+                                   Group: <span className="font-semibold">{survivalPreflight.recommendedGroupVar || 'Not detected'}</span>
+                                   {' '}| Time: <span className="font-semibold">{survivalPreflight.recommendedTimeVar || 'Not detected'}</span>
+                                   {' '}| Censoring: <span className="font-semibold">{survivalPreflight.censorColumn || 'Not detected'}</span>
+                                 </div>
+                                 <div className="mt-1 text-xs text-slate-600">
+                                   Valid rows: {survivalPreflight.recommendedValidRows} | Groups: {survivalPreflight.recommendedGroupCount}
+                                   {variable1 || variable2 ? ` | Current selection valid rows: ${survivalPreflight.currentValidRows}` : ''}
+                                 </div>
+                                 {survivalPreflight.currentValidRows < 3 || survivalPreflight.currentGroupCount < 2 ? (
+                                   <div className="mt-2 text-xs font-medium text-amber-800">
+                                     The current selection does not provide enough valid rows for survival analysis. Use the detected setup to run Kaplan-Meier or Cox on this dataset.
+                                   </div>
+                                 ) : (
+                                   <div className="mt-2 text-xs font-medium text-emerald-800">
+                                     The current selection looks valid for survival analysis.
+                                   </div>
+                                 )}
+                               </div>
+                               {survivalPreflight.recommendedGroupVar && survivalPreflight.recommendedTimeVar && survivalPreflight.recommendedValidRows >= 3 && survivalPreflight.recommendedGroupCount >= 2 && (
+                                 <button
+                                   onClick={applyDetectedSurvivalSetup}
+                                   type="button"
+                                   className="inline-flex items-center justify-center rounded-lg border border-medical-200 bg-white px-3 py-2 text-xs font-bold text-medical-700 hover:bg-medical-50"
+                                 >
+                                   Use detected survival setup
+                                 </button>
+                               )}
+                             </div>
+                           </div>
+                         )}
 
                          {/* Advanced Adjustments Section */}
                          {studyType === StudyType.RWE && (

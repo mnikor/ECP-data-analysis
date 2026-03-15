@@ -1,6 +1,7 @@
 import {
   ChatMessage,
   ClinicalFile,
+  DataType,
   MappingSpec,
   AnalysisResponse,
   StatAnalysisResult,
@@ -17,6 +18,12 @@ import {
 import { isIsoDate, normalizeSex, parseCsv, stringifyCsv, toNumber } from "../utils/dataProcessing";
 import { executeLocalStatisticalAnalysis } from "../utils/statisticsEngine";
 import { formatComparisonLabel, formatDisplayName } from "../utils/displayNames";
+import { planAnalysisFromQuestion } from "../utils/queryPlanner";
+import {
+  type DatasetProfileKind,
+  findHeaderByAlias as matchHeaderByAlias,
+  inferDatasetProfileFromHeaders,
+} from "../utils/datasetProfile";
 
 const JsonType = {
   OBJECT: 'OBJECT',
@@ -158,6 +165,171 @@ const formatAiServiceError = (error: unknown): string => {
   return `AI service error: ${message}`;
 };
 
+const CHAT_EXECUTION_INTENT = /compare|difference|association|correlat|regress|incidence|rate|frequency|distribution|trend|outlier|analy[sz]e|analysis|run|test|chart|kaplan|survival|hazard|cox|anova|chi[- ]?square|t[- ]?test/i;
+const CHAT_GUIDANCE_INTENT = /what can i do|which workflow|how should i|what does this dataset|review the selected|explain the dataset|what files|how to start/i;
+
+const canRunExploratoryChatAnalysis = (query: string, contextFiles: ClinicalFile[]): ClinicalFile | null => {
+  if (!CHAT_EXECUTION_INTENT.test(query) || CHAT_GUIDANCE_INTENT.test(query)) {
+    return null;
+  }
+
+  const dataFiles = contextFiles.filter(
+    (file) => (file.type === DataType.RAW || file.type === DataType.STANDARDIZED) && Boolean(file.content)
+  );
+
+  return dataFiles.length === 1 ? dataFiles[0] : null;
+};
+
+const median = (values: number[]): number | null => {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1] + sorted[middle]) / 2
+    : sorted[middle];
+};
+
+const formatNumberSummary = (values: number[]): string => {
+  if (values.length === 0) return 'no non-missing values';
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const med = median(values);
+  return `n=${values.length}, min=${min.toFixed(2)}, median=${(med ?? 0).toFixed(2)}, max=${max.toFixed(2)}`;
+};
+
+const summarizeCategoricalColumn = (rows: Record<string, string>[], column: string, limit = 6): string => {
+  const counts = new Map<string, number>();
+  rows.forEach((row) => {
+    const value = (row[column] || '').trim();
+    if (!value) return;
+    counts.set(value, (counts.get(value) || 0) + 1);
+  });
+
+  if (counts.size === 0) return `${column}: no non-missing values`;
+
+  return `${column}: ${Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([value, count]) => `${value} (${count})`)
+    .join(', ')}`;
+};
+
+const summarizeNumericColumn = (rows: Record<string, string>[], column: string): string => {
+  const values = rows.map((row) => toNumber(row[column])).filter((value): value is number => value != null);
+  return `${column}: ${formatNumberSummary(values)}`;
+};
+
+export const buildTabularChatContext = (file: ClinicalFile): string => {
+  if (!file.content) {
+    return `TABULAR DATASET PROFILE\n- Source: ${file.name}\n- No tabular content is available.`;
+  }
+
+  try {
+    const { headers, rows } = parseCsv(file.content);
+    const profile = inferDatasetProfileFromHeaders(file.name, file.type, headers);
+    const subjectColumn = matchHeaderByAlias(headers, ['USUBJID', 'SUBJID', 'SUBJECT_ID', 'PATIENT_ID', 'PATID', 'SUBJECT']);
+    const treatmentColumn = matchHeaderByAlias(headers, ['TRT01A', 'TRTA', 'TRTP', 'ACTARM', 'ARM', 'ARMCD', 'TRTGRP']);
+    const timeColumn = matchHeaderByAlias(headers, ['AVAL', 'TIME', 'OS_TIME', 'PFS_TIME', 'ADTTE', 'DTHDY', 'ADT']);
+    const censorColumn = matchHeaderByAlias(headers, ['CNSR', 'STATUS', 'EVENT', 'EVENTFL', 'OS_EVENT', 'PFS_EVENT', 'CENSOR']);
+    const parameterColumn = matchHeaderByAlias(headers, ['PARAMCD', 'PARAM']);
+    const analysisFlagColumn = matchHeaderByAlias(headers, ['ANL01FL', 'ANL02FL', 'SAFFL', 'ITTFL', 'EFFFL']);
+
+    const uniqueSubjects = subjectColumn
+      ? new Set(rows.map((row) => (row[subjectColumn] || '').trim()).filter(Boolean)).size
+      : null;
+
+    const parameterValues = parameterColumn
+      ? Array.from(new Set(rows.map((row) => (row[parameterColumn] || '').trim()).filter(Boolean))).slice(0, 10)
+      : [];
+
+    const lines = [
+      'TABULAR DATASET PROFILE',
+      `- Source: ${file.name}`,
+      `- Dataset profile: ${profile.shortLabel} (${profile.label})`,
+      `- Rows: ${rows.length}`,
+      `- Columns: ${headers.length}`,
+      subjectColumn ? `- Unique subjects (${subjectColumn}): ${uniqueSubjects}` : '- Unique subject count: no subject identifier detected',
+      `- Headers: ${headers.slice(0, 20).join(', ')}${headers.length > 20 ? ', ...' : ''}`,
+    ];
+
+    if (profile.guidance) {
+      lines.push(`- Guidance: ${profile.guidance}`);
+    }
+
+    if (parameterColumn) {
+      lines.push(`- Parameter coverage (${parameterColumn}): ${parameterValues.length > 0 ? parameterValues.join(', ') : 'none detected'}`);
+    }
+
+    if (analysisFlagColumn) {
+      lines.push(`- Analysis/population flag summary: ${summarizeCategoricalColumn(rows, analysisFlagColumn, 4)}`);
+    }
+
+    if (treatmentColumn) {
+      lines.push(`- Treatment/group summary: ${summarizeCategoricalColumn(rows, treatmentColumn, 6)}`);
+    }
+
+    if (timeColumn) {
+      lines.push(`- Candidate time endpoint summary: ${summarizeNumericColumn(rows, timeColumn)}`);
+    }
+
+    if (censorColumn) {
+      lines.push(`- Candidate censor/event summary: ${summarizeCategoricalColumn(rows, censorColumn, 6)}`);
+    }
+
+    lines.push('- Use these full-dataset counts and summaries instead of inferring cohort size from a short row fragment.');
+    return lines.join('\n');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return `TABULAR DATASET PROFILE\n- Source: ${file.name}\n- Structured summary could not be prepared: ${message}`;
+  }
+};
+
+export const buildChatContextText = (contextFiles: ClinicalFile[], mode: 'RAG' | 'STUFFING'): string => {
+  if (contextFiles.length === 0) return 'No context files selected.';
+
+  const sections = contextFiles.map((file) => {
+    const isTabular = file.type === DataType.RAW || file.type === DataType.STANDARDIZED;
+    if (isTabular) {
+      return buildTabularChatContext(file);
+    }
+
+    if (mode === 'STUFFING') {
+      return `--- DOCUMENT: ${file.name} ---\n${file.content || 'No text content available.'}\n--- END DOCUMENT ---`;
+    }
+
+    return `[Source: ${file.name}]: ${(file.content || 'No text content available.').substring(0, 1200)}...`;
+  });
+
+  return mode === 'RAG'
+    ? `RETRIEVED CONTEXT:\n${sections.join('\n\n')}`
+    : sections.join('\n\n');
+};
+
+const buildExploratoryChatInsights = (
+  datasetName: string,
+  testType: StatTestType,
+  var1: string,
+  var2: string,
+  metrics: Record<string, string | number>
+): string[] => {
+  const insights = [
+    `Executed a deterministic exploratory ${testType} on ${datasetName}.`,
+    `Variables used: ${formatDisplayName(var1)} and ${formatDisplayName(var2)}.`,
+  ];
+
+  if (metrics.p_value != null) {
+    insights.push(`Primary p-value: ${metrics.p_value}.`);
+  }
+
+  if (metrics.total_n != null) {
+    insights.push(`Rows included in the analysis: ${metrics.total_n}.`);
+  } else if (metrics.n != null) {
+    insights.push(`Rows included in the analysis: ${metrics.n}.`);
+  }
+
+  return insights;
+};
+
 const normalizeDate = (value: string): string | null => {
   if (!value) return null;
   if (isIsoDate(value)) return value;
@@ -204,26 +376,14 @@ interface QCColumnRequirement {
 }
 
 interface QCProfile {
+  kind: DatasetProfileKind;
   name: string;
   required: QCColumnRequirement[];
+  recommended?: QCColumnRequirement[];
 }
 
-const findHeaderByAlias = (headers: string[], aliases: string[]): string | null => {
-  const normalizedHeaders = headers.map((header) => ({
-    raw: header,
-    lower: header.toLowerCase().replace(/[^a-z0-9]/g, ''),
-  }));
-  for (const alias of aliases) {
-    const normalizedAlias = alias.toLowerCase().replace(/[^a-z0-9]/g, '');
-    const exact = normalizedHeaders.find((header) => header.lower === normalizedAlias);
-    if (exact) return exact.raw;
-    const partial = normalizedHeaders.find((header) => header.lower.includes(normalizedAlias));
-    if (partial) return partial.raw;
-  }
-  return null;
-};
-
 const inferQCProfile = (file: ClinicalFile, headers: string[]): QCProfile => {
+  const datasetProfile = inferDatasetProfileFromHeaders(file.name || '', file.type, headers);
   const fileName = (file.name || '').toLowerCase();
   const lowerHeaders = headers.map((header) => header.toLowerCase());
   const headerText = lowerHeaders.join(' ');
@@ -232,9 +392,78 @@ const inferQCProfile = (file: ClinicalFile, headers: string[]): QCProfile => {
     label: 'Subject ID',
     aliases: ['USUBJID', 'SUBJID', 'SUBJECT_ID', 'PATIENT_ID'],
   };
+  const treatmentVariable: QCColumnRequirement = {
+    label: 'Treatment Variable',
+    aliases: ['TRT01A', 'TRTA', 'TRT01P', 'ARM', 'ACTARM', 'TRT_ARM', 'TREATMENT_ARM'],
+  };
+  const populationFlag: QCColumnRequirement = {
+    label: 'Analysis Population Flag',
+    aliases: ['ANL01FL', 'SAFFL', 'ITTFL', 'EFFFL', 'PPSFL'],
+  };
+  const parameterColumn: QCColumnRequirement = {
+    label: 'Parameter',
+    aliases: ['PARAM', 'PARAMCD'],
+  };
+  const valueColumn: QCColumnRequirement = {
+    label: 'Analysis Value',
+    aliases: ['AVAL', 'CHG', 'BASE'],
+  };
+  const analysisDate: QCColumnRequirement = {
+    label: 'Analysis Date',
+    aliases: ['ADT', 'ADTM', 'ADY', 'AVISIT', 'AVISITN'],
+  };
+
+  switch (datasetProfile.kind) {
+    case 'ADSL':
+      return {
+        kind: datasetProfile.kind,
+        name: datasetProfile.shortLabel,
+        required: [subjectId],
+        recommended: [treatmentVariable, populationFlag],
+      };
+    case 'ADAE':
+      return {
+        kind: datasetProfile.kind,
+        name: datasetProfile.shortLabel,
+        required: [
+          subjectId,
+          { label: 'Event Term', aliases: ['AEDECOD', 'AETERM', 'PT'] },
+        ],
+        recommended: [
+          treatmentVariable,
+          { label: 'Treatment-Emergent Flag', aliases: ['TRTEMFL'] },
+          { label: 'Safety Flag', aliases: ['SAFFL'] },
+          { label: 'Seriousness', aliases: ['AESER', 'SERIOUS'] },
+        ],
+      };
+    case 'ADLB':
+      return {
+        kind: datasetProfile.kind,
+        name: datasetProfile.shortLabel,
+        required: [subjectId, parameterColumn, valueColumn],
+        recommended: [treatmentVariable, populationFlag, analysisDate],
+      };
+    case 'ADTTE':
+      return {
+        kind: datasetProfile.kind,
+        name: datasetProfile.shortLabel,
+        required: [subjectId, parameterColumn, { label: 'Time-to-Event Value', aliases: ['AVAL'] }, { label: 'Censoring Flag', aliases: ['CNSR'] }],
+        recommended: [treatmentVariable, populationFlag],
+      };
+    case 'BDS':
+      return {
+        kind: datasetProfile.kind,
+        name: datasetProfile.shortLabel,
+        required: [subjectId, parameterColumn, valueColumn],
+        recommended: [treatmentVariable, populationFlag, analysisDate],
+      };
+    default:
+      break;
+  }
 
   if (fileName.includes('demog') || fileName.includes('dm') || / age | sex | race /.test(` ${headerText} `)) {
     return {
+      kind: 'DEMOGRAPHICS',
       name: 'Demographics',
       required: [
         subjectId,
@@ -246,6 +475,7 @@ const inferQCProfile = (file: ClinicalFile, headers: string[]): QCProfile => {
 
   if (fileName.includes('adverse') || headerText.includes('aeterm') || headerText.includes(' pt ')) {
     return {
+      kind: 'ADVERSE_EVENTS',
       name: 'Adverse Events',
       required: [
         subjectId,
@@ -257,6 +487,7 @@ const inferQCProfile = (file: ClinicalFile, headers: string[]): QCProfile => {
 
   if (fileName.includes('exposure') || headerText.includes('dose') || headerText.includes('exstdtc') || headerText.includes('extrt')) {
     return {
+      kind: 'EXPOSURE',
       name: 'Exposure',
       required: [
         subjectId,
@@ -269,6 +500,7 @@ const inferQCProfile = (file: ClinicalFile, headers: string[]): QCProfile => {
 
   if (fileName.includes('lab') || headerText.includes('lbstres') || headerText.includes('lborres')) {
     return {
+      kind: 'LABS',
       name: 'Labs',
       required: [
         subjectId,
@@ -280,6 +512,7 @@ const inferQCProfile = (file: ClinicalFile, headers: string[]): QCProfile => {
 
   if (fileName.includes('visit') || headerText.includes('visitnum') || headerText.includes('visit')) {
     return {
+      kind: 'VISITS',
       name: 'Visits',
       required: [
         subjectId,
@@ -291,6 +524,7 @@ const inferQCProfile = (file: ClinicalFile, headers: string[]): QCProfile => {
 
   if (fileName.includes('concomitant') || headerText.includes('cmstdtc') || headerText.includes('cmid') || headerText.includes('cmtrt')) {
     return {
+      kind: 'CONMEDS',
       name: 'Concomitant Medications',
       required: [
         subjectId,
@@ -302,6 +536,7 @@ const inferQCProfile = (file: ClinicalFile, headers: string[]): QCProfile => {
 
   if (fileName.includes('tumor') || fileName.includes('recist')) {
     return {
+      kind: 'TUMOR',
       name: 'Tumor Assessments',
       required: [
         subjectId,
@@ -313,6 +548,7 @@ const inferQCProfile = (file: ClinicalFile, headers: string[]): QCProfile => {
 
   if (fileName.includes('molecular') || headerText.includes('gene') || headerText.includes('mutation')) {
     return {
+      kind: 'MOLECULAR',
       name: 'Molecular Profile',
       required: [
         subjectId,
@@ -322,6 +558,7 @@ const inferQCProfile = (file: ClinicalFile, headers: string[]): QCProfile => {
   }
 
   return {
+    kind: 'GENERIC',
     name: 'Generic Clinical Dataset',
     required: [subjectId],
   };
@@ -329,11 +566,86 @@ const inferQCProfile = (file: ClinicalFile, headers: string[]): QCProfile => {
 
 const resolveRequiredColumns = (file: ClinicalFile, headers: string[]) => {
   const profile = inferQCProfile(file, headers);
-  const resolved = profile.required.map((requirement) => ({
+  const resolvedRequired = profile.required.map((requirement) => ({
     ...requirement,
-    actual: findHeaderByAlias(headers, requirement.aliases),
+    actual: matchHeaderByAlias(headers, requirement.aliases),
   }));
-  return { profile, resolved };
+  const resolvedRecommended = (profile.recommended || []).map((requirement) => ({
+    ...requirement,
+    actual: matchHeaderByAlias(headers, requirement.aliases),
+  }));
+  return { profile, resolvedRequired, resolvedRecommended };
+};
+
+const countDistinctColumnValues = (rows: Record<string, string>[], column: string): number =>
+  new Set(rows.map((row) => (row[column] || '').trim()).filter(Boolean)).size;
+
+const buildAdamAdvisoryIssues = (
+  profile: QCProfile,
+  headers: string[],
+  rows: Record<string, string>[],
+  resolvedRequired: Array<QCColumnRequirement & { actual: string | null }>,
+  resolvedRecommended: Array<QCColumnRequirement & { actual: string | null }>
+): QCIssue[] => {
+  const issues: QCIssue[] = [];
+  const missingRecommended = resolvedRecommended.filter((item) => !item.actual).map((item) => item.label);
+
+  if (missingRecommended.length > 0) {
+    issues.push({
+      severity: 'LOW',
+      description: `Recommended ADaM review columns not found for ${profile.name}: ${missingRecommended.join(', ')}`,
+      affectedRows: 'Header',
+      autoFixable: false,
+      remediationHint: 'The dataset can still be explored, but confirm population flags, treatment variables, and analysis dates before making final conclusions.',
+    });
+  }
+
+  if (profile.kind === 'ADLB' || profile.kind === 'BDS') {
+    const parameterColumn =
+      resolvedRequired.find((item) => item.label === 'Parameter')?.actual ||
+      matchHeaderByAlias(headers, ['PARAM', 'PARAMCD']);
+    const analysisFlagColumn =
+      resolvedRecommended.find((item) => item.label === 'Analysis Population Flag')?.actual ||
+      matchHeaderByAlias(headers, ['ANL01FL', 'SAFFL', 'ITTFL', 'EFFFL', 'PPSFL']);
+    if (parameterColumn) {
+      const distinctParameters = countDistinctColumnValues(rows, parameterColumn);
+      if (distinctParameters > 1 && !analysisFlagColumn) {
+        issues.push({
+          severity: 'MEDIUM',
+          description: `${profile.name} contains ${distinctParameters} analysis parameters but no analysis/population flag column.`,
+          affectedRows: 'Header',
+          autoFixable: false,
+          remediationHint: 'Filter to a single parameter and confirm the intended analysis flag before running inferential statistics.',
+        });
+      }
+    }
+  }
+
+  if (profile.kind === 'ADTTE') {
+    const parameterColumn =
+      resolvedRequired.find((item) => item.label === 'Parameter')?.actual ||
+      matchHeaderByAlias(headers, ['PARAM', 'PARAMCD']);
+    const distinctParameters = parameterColumn ? countDistinctColumnValues(rows, parameterColumn) : 0;
+    if (distinctParameters > 1) {
+      issues.push({
+        severity: 'MEDIUM',
+        description: `${profile.name} contains ${distinctParameters} time-to-event endpoints. Filter to one PARAM/PARAMCD before Kaplan-Meier or Cox analysis.`,
+        affectedRows: 'Header',
+        autoFixable: false,
+        remediationHint: 'Select a single endpoint such as OS or PFS before running survival analysis.',
+      });
+    } else {
+      issues.push({
+        severity: 'LOW',
+        description: `${profile.name} recognized. Review censoring semantics and population/treatment flags before interpreting Kaplan-Meier or Cox results.`,
+        affectedRows: 'Header',
+        autoFixable: false,
+        remediationHint: 'Confirm the meaning of CNSR, the treatment variable, and the analysis population before final interpretation.',
+      });
+    }
+  }
+
+  return issues;
 };
 
 const applyMappingTransformation = (
@@ -368,14 +680,55 @@ export const generateAnalysis = async (
   mode: 'RAG' | 'STUFFING',
   history: ChatMessage[]
 ): Promise<AnalysisResponse> => {
-  let contextText = "";
-  
-  if (mode === 'STUFFING') {
-    contextText = contextFiles.map(f => `--- DOCUMENT: ${f.name} ---\n${f.content || 'No text content available.'}\n--- END DOCUMENT ---`).join('\n\n');
-  } else {
-    // Mock RAG: Just take the first 500 chars of each doc
-    contextText = "RETRIEVED FRAGMENTS:\n" + contextFiles.map(f => `[Source: ${f.name}]: ${f.content?.substring(0, 500)}...`).join('\n\n');
+  const exploratoryFile = canRunExploratoryChatAnalysis(query, contextFiles);
+  if (exploratoryFile) {
+    try {
+      const plan = planAnalysisFromQuestion(exploratoryFile, query);
+      const result = executeLocalStatisticalAnalysis(
+        exploratoryFile,
+        plan.testType,
+        plan.var1,
+        plan.var2,
+        plan.concept
+      );
+
+      return {
+        answer: [
+          '### Exploratory analysis executed',
+          `Ran **${plan.testType}** on \`${exploratoryFile.name}\`.`,
+          `**Variables:** \`${plan.var1}\` vs \`${plan.var2}\``,
+          '',
+          '### Statistical interpretation',
+          result.interpretation,
+          '',
+          '### Why this test was chosen',
+          plan.explanation,
+          '',
+          'Use **Statistical Analysis** when you need to edit variables, review code, or rerun this in a controlled workflow.',
+        ].join('\n'),
+        chartConfig: result.chartConfig,
+        tableConfig: result.tableConfig,
+        keyInsights: buildExploratoryChatInsights(
+          exploratoryFile.name,
+          plan.testType,
+          plan.var1,
+          plan.var2,
+          result.metrics
+        ),
+      };
+    } catch (error) {
+      return {
+        answer: [
+          '### Exploratory analysis could not be executed',
+          error instanceof Error ? error.message : String(error),
+          '',
+          'Use **Statistical Analysis** if you need to inspect variables manually or prepare the dataset before rerunning the analysis.',
+        ].join('\n'),
+      };
+    }
   }
+
+  const contextText = buildChatContextText(contextFiles, mode);
 
   const systemInstruction = `You are an expert Clinical Data Scientist and Medical Monitor. 
   Your goal is to assist with clinical study analysis, signal detection, and root cause analysis.
@@ -484,10 +837,14 @@ export const generateStatisticalCode = async (
   const contextSnippet = contextDocuments.length > 0
     ? contextDocuments.map(d => `--- ${d.name} ---\n${d.content?.substring(0, 3000)}...`).join('\n\n')
     : "No Protocol or SAP provided.";
+  const survivalLibraryHint =
+    testType === StatTestType.KAPLAN_MEIER || testType === StatTestType.COX_PH
+      ? '\n  5a. For time-to-event analysis, use lifelines or statsmodels survival utilities. Treat Variable 2 as the time variable and infer the censor column from CNSR / STATUS / EVENT-like fields.\n'
+      : '';
 
   const prompt = `
   You are a Senior Statistical Programmer.
-  TASK: Write a clean, commented Python script using pandas and scipy.stats (or scikit-learn/statsmodels for advanced adjustments) to perform a ${testType}.
+  TASK: Write a clean, commented Python script using pandas and scipy.stats (or scikit-learn/statsmodels/lifelines for advanced or survival analyses) to perform a ${testType}.
   
   TARGET DATASET:
   - Name: ${file.name}
@@ -510,6 +867,7 @@ export const generateStatisticalCode = async (
   3. Assume the data is loaded into a DataFrame named 'df'.
   4. If Imputation is requested, use scikit-learn (e.g., SimpleImputer or IterativeImputer) before the main analysis.
   5. If PSM is requested, use LogisticRegression to calculate propensity scores based on the covariates, perform nearest-neighbor matching, and run the final ${testType} on the matched cohort.
+  ${survivalLibraryHint}
   6. If covariates are provided but PSM is false, include them in a multivariable model if the test type supports it (e.g., ANCOVA, Logistic Regression).
   7. Perform the statistical test (${testType}).
   8. Print the key results (p-value, test statistic, etc).
@@ -682,6 +1040,13 @@ export const generateSASCode = async (
   imputationMethod: string = 'None',
   applyPSM: boolean = false
 ): Promise<string> => {
+  const procHint =
+    testType === StatTestType.KAPLAN_MEIER
+      ? 'PROC LIFETEST'
+      : testType === StatTestType.COX_PH
+        ? 'PROC PHREG'
+        : 'PROC TTEST, PROC GLM, PROC FREQ, PROC CORR';
+
   const prompt = `
   You are a Senior Statistical Programmer in the Pharmaceutical Industry.
   TASK: Convert the following analysis logic into regulatory-grade SAS code (SAS 9.4+).
@@ -701,7 +1066,7 @@ export const generateSASCode = async (
   ${pythonCode}
 
   REQUIREMENTS:
-  1. Use standard PROCs (e.g., PROC TTEST, PROC GLM, PROC FREQ, PROC CORR).
+  1. Use the appropriate SAS procedures (e.g., ${procHint}).
   2. If Imputation is requested, use PROC MI.
   3. If PSM is requested, use PROC PSMATCH.
   4. Include ODS OUTPUT statements to capture statistics.
@@ -727,11 +1092,11 @@ export const runQualityCheck = async (file: ClinicalFile): Promise<{ status: QCS
 
   try {
     const { headers, rows } = parseCsv(file.content);
-    const { profile, resolved } = resolveRequiredColumns(file, headers);
-    const missingHeaders = resolved.filter((item) => !item.actual).map((item) => item.label);
-    const presentCriticalHeaders = resolved.filter((item) => item.actual).map((item) => item.actual as string);
-    const ageColumn = resolved.find((item) => item.label === 'AGE')?.actual || findHeaderByAlias(headers, ['AGE']);
-    const sexColumn = resolved.find((item) => item.label === 'SEX')?.actual || findHeaderByAlias(headers, ['SEX', 'GENDER']);
+    const { profile, resolvedRequired, resolvedRecommended } = resolveRequiredColumns(file, headers);
+    const missingHeaders = resolvedRequired.filter((item) => !item.actual).map((item) => item.label);
+    const presentCriticalHeaders = resolvedRequired.filter((item) => item.actual).map((item) => item.actual as string);
+    const ageColumn = resolvedRequired.find((item) => item.label === 'AGE')?.actual || matchHeaderByAlias(headers, ['AGE']);
+    const sexColumn = resolvedRequired.find((item) => item.label === 'SEX')?.actual || matchHeaderByAlias(headers, ['SEX', 'GENDER']);
 
     if (missingHeaders.length > 0) {
       issues.push({
@@ -826,6 +1191,10 @@ export const runQualityCheck = async (file: ClinicalFile): Promise<{ status: QCS
       });
     }
 
+    if (profile.kind === 'ADSL' || profile.kind === 'ADAE' || profile.kind === 'ADLB' || profile.kind === 'ADTTE' || profile.kind === 'BDS') {
+      issues.push(...buildAdamAdvisoryIssues(profile, headers, rows, resolvedRequired, resolvedRecommended));
+    }
+
     const hasHigh = issues.some((issue) => issue.severity === 'HIGH');
     const status: QCStatus = issues.length === 0 ? 'PASS' : hasHigh ? 'FAIL' : 'WARN';
     return { status, issues };
@@ -853,10 +1222,10 @@ export const generateCleaningSuggestion = async (file: ClinicalFile, issues: QCI
       return [];
     }
   })();
-  const { resolved } = resolveRequiredColumns(file, headers);
-  const presentCriticalHeaders = resolved.filter((item) => item.actual).map((item) => item.actual as string);
-  const ageColumn = resolved.find((item) => item.label === 'AGE')?.actual || findHeaderByAlias(headers, ['AGE']);
-  const sexColumn = resolved.find((item) => item.label === 'SEX')?.actual || findHeaderByAlias(headers, ['SEX', 'GENDER']);
+  const { resolvedRequired } = resolveRequiredColumns(file, headers);
+  const presentCriticalHeaders = resolvedRequired.filter((item) => item.actual).map((item) => item.actual as string);
+  const ageColumn = resolvedRequired.find((item) => item.label === 'AGE')?.actual || matchHeaderByAlias(headers, ['AGE']);
+  const sexColumn = resolvedRequired.find((item) => item.label === 'SEX')?.actual || matchHeaderByAlias(headers, ['SEX', 'GENDER']);
   const isAutoFixableIssue = (issue: QCIssue) => {
     if (typeof issue.autoFixable === 'boolean') return issue.autoFixable;
     return !/missing critical columns|failed to parse dataset/i.test(issue.description);
@@ -950,7 +1319,7 @@ export const parseNaturalLanguageAnalysis = async (
 
   Return a JSON object matching this schema:
   {
-    "testType": "T_TEST" | "CHI_SQUARE" | "ANOVA" | "LOGISTIC_REGRESSION" | "LINEAR_REGRESSION" | "SURVIVAL_KAPLAN_MEIER" | "COX_PROPORTIONAL_HAZARDS",
+    "testType": "T-Test" | "Chi-Square" | "ANOVA" | "Linear Regression" | "Correlation Analysis" | "Kaplan-Meier / Log-Rank" | "Cox Proportional Hazards",
     "var1": "exact_column_name",
     "var2": "exact_column_name",
     "covariates": ["col1", "col2"],
@@ -979,10 +1348,10 @@ export const parseNaturalLanguageAnalysis = async (
 export const applyCleaning = async (file: ClinicalFile, code: string): Promise<string> => {
   try {
     const { headers, rows } = parseCsv(file.content);
-    const { resolved } = resolveRequiredColumns(file, headers);
-    const presentCriticalHeaders = resolved.filter((item) => item.actual).map((item) => item.actual as string);
-    const ageColumn = resolved.find((item) => item.label === 'AGE')?.actual || findHeaderByAlias(headers, ['AGE']);
-    const sexColumn = resolved.find((item) => item.label === 'SEX')?.actual || findHeaderByAlias(headers, ['SEX', 'GENDER']);
+    const { resolvedRequired } = resolveRequiredColumns(file, headers);
+    const presentCriticalHeaders = resolvedRequired.filter((item) => item.actual).map((item) => item.actual as string);
+    const ageColumn = resolvedRequired.find((item) => item.label === 'AGE')?.actual || matchHeaderByAlias(headers, ['AGE']);
+    const sexColumn = resolvedRequired.find((item) => item.label === 'SEX')?.actual || matchHeaderByAlias(headers, ['SEX', 'GENDER']);
     const cleanedRows = rows
       .map((row) => {
         const next = { ...row };
@@ -1125,6 +1494,14 @@ export const generateStatisticalSuggestions = async (file: ClinicalFile): Promis
  
      const prompt = `
      Suggest 3 statistical tests relevant for this clinical dataset.
+     Prefer only these exact test names:
+     - ${StatTestType.T_TEST}
+     - ${StatTestType.CHI_SQUARE}
+     - ${StatTestType.ANOVA}
+     - ${StatTestType.REGRESSION}
+     - ${StatTestType.CORRELATION}
+     - ${StatTestType.KAPLAN_MEIER}
+     - ${StatTestType.COX_PH}
      DATA HEADER: ${headers.join(', ')}
      
      OUTPUT JSON:
@@ -1227,6 +1604,8 @@ export const generateBiasAudit = async (dmFile: ClinicalFile, indication: string
 
 const normalizeTestType = (raw: string): StatTestType | null => {
   const value = raw.toLowerCase().trim();
+  if (value.includes('kaplan') || value.includes('log-rank') || value.includes('log rank')) return StatTestType.KAPLAN_MEIER;
+  if (value.includes('cox') || value.includes('hazard')) return StatTestType.COX_PH;
   if (value.includes('chi')) return StatTestType.CHI_SQUARE;
   if (value.includes('anova')) return StatTestType.ANOVA;
   if (value.includes('t-test') || value.includes('ttest')) return StatTestType.T_TEST;
@@ -1261,12 +1640,29 @@ const inferNumericColumns = (headers: string[], rows: Record<string, string>[]):
   });
 };
 
+const inferTimeToEventColumn = (headers: string[], rows: Record<string, string>[]): string | null => {
+  const numericColumns = headers.filter((header) => {
+    const sample = rows.slice(0, 300);
+    const nonEmpty = sample.map((row) => row[header]).filter((value) => value != null && value.trim() !== '');
+    if (nonEmpty.length === 0) return false;
+    const numericCount = nonEmpty.filter((value) => toNumber(value) != null).length;
+    return numericCount >= Math.max(1, Math.floor(nonEmpty.length * 0.75));
+  });
+  const hints = ['aval', 'time', 'month', 'months', 'day', 'days', 'duration', 'tte', 'os', 'pfs'];
+  for (const hint of hints) {
+    const found = numericColumns.find((header) => header.toLowerCase().includes(hint));
+    if (found) return found;
+  }
+  return numericColumns[0] || null;
+};
+
 const extractPlanFallback = (protocolText: string, sourceFile: ClinicalFile): { plan: AnalysisPlanEntry[]; notes: string[] } => {
   const notes: string[] = [];
   const { headers, rows } = parseCsv(sourceFile.content);
   const numericColumns = inferNumericColumns(headers, rows);
   const groupCol = inferGroupColumn(headers) || headers[0];
   const eventCol = inferEventColumn(headers);
+  const timeToEventCol = inferTimeToEventColumn(headers, rows);
   const text = protocolText.toLowerCase();
   const plan: AnalysisPlanEntry[] = [];
 
@@ -1305,6 +1701,12 @@ const extractPlanFallback = (protocolText: string, sourceFile: ClinicalFile): { 
   }
   if (/regression|predict|effect of|adjust(ed|ment)/i.test(text)) {
     addEntry('Regression analysis', StatTestType.REGRESSION, numericColumns[0] || groupCol, numericColumns[1] || numericColumns[0], 'Detected regression/predictive language.');
+  }
+  if (/(kaplan|log[- ]?rank|time[- ]to[- ]event|overall survival|progression[- ]free|pfs|os\b|survival)/i.test(text)) {
+    addEntry('Kaplan-Meier / Log-Rank analysis', StatTestType.KAPLAN_MEIER, groupCol, timeToEventCol, 'Detected time-to-event / survival analysis language.');
+  }
+  if (/(cox|hazard ratio|proportional hazards)/i.test(text)) {
+    addEntry('Cox proportional hazards model', StatTestType.COX_PH, groupCol, timeToEventCol, 'Detected hazard ratio / Cox model language.');
   }
 
   if (plan.length === 0) {
@@ -1372,6 +1774,8 @@ Supported test types only:
 - ${StatTestType.ANOVA}
 - ${StatTestType.REGRESSION}
 - ${StatTestType.CORRELATION}
+- ${StatTestType.KAPLAN_MEIER}
+- ${StatTestType.COX_PH}
 
 Dataset columns (use exact names only):
 ${headers.join(', ')}

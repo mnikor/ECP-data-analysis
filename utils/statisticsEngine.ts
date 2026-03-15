@@ -6,6 +6,10 @@ import { formatChartTitle, formatComparisonLabel, formatDisplayName } from './di
 
 const normalizeTestType = (raw: string): StatTestType | null => {
   const value = raw.toLowerCase().replace(/[_\s]+/g, ' ').trim();
+  if (value.includes('kaplan') || value.includes('log-rank') || value.includes('log rank')) {
+    return StatTestType.KAPLAN_MEIER;
+  }
+  if (value.includes('cox') || value.includes('hazard')) return StatTestType.COX_PH;
   if (value.includes('chi')) return StatTestType.CHI_SQUARE;
   if (value.includes('anova')) return StatTestType.ANOVA;
   if (value.includes('t-test') || value.includes('t test') || value.includes('ttest')) return StatTestType.T_TEST;
@@ -184,6 +188,548 @@ const buildMetricTable = (title: string, metrics: Record<string, string | number
     value: String(value),
   })),
 });
+
+type SurvivalRecord = {
+  group: string;
+  time: number;
+  event: boolean;
+  covariate: number;
+};
+
+type KaplanMeierCurve = {
+  x: number[];
+  y: number[];
+  censorX: number[];
+  censorY: number[];
+  n: number;
+  events: number;
+  censored: number;
+  medianSurvival: number | null;
+};
+
+const KAPLAN_MEIER_COLORS = ['#2563eb', '#16a34a', '#ea580c', '#7c3aed', '#dc2626', '#0f766e'];
+
+const normalizeFieldKey = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+const findHeaderByHints = (headers: string[], hints: string[]): string | null => {
+  const normalizedHeaders = headers.map((header) => ({
+    raw: header,
+    normalized: normalizeFieldKey(header),
+  }));
+
+  for (const hint of hints) {
+    const normalizedHint = normalizeFieldKey(hint);
+    const exact = normalizedHeaders.find((header) => header.normalized === normalizedHint);
+    if (exact) return exact.raw;
+    const partial = normalizedHeaders.find((header) => header.normalized.includes(normalizedHint));
+    if (partial) return partial.raw;
+  }
+
+  return null;
+};
+
+const inferSurvivalCensorColumn = (headers: string[], groupVar: string, timeVar: string): string | null =>
+  findHeaderByHints(
+    headers.filter((header) => header !== groupVar && header !== timeVar),
+    ['CNSR', 'CENSOR', 'CENSORING', 'EVENT', 'EVENTFL', 'STATUS', 'OS_EVENT', 'PFS_EVENT', 'DEATH', 'DEATHFL']
+  );
+
+const parseEventObserved = (rawValue: string, censorColumn: string): boolean | null => {
+  const value = rawValue.trim().toLowerCase();
+  if (!value) return null;
+
+  const usesCensorCoding = /cnsr|censor/.test(censorColumn.toLowerCase());
+
+  if (['0', '0.0', 'n', 'no', 'false'].includes(value)) return usesCensorCoding ? true : false;
+  if (['1', '1.0', 'y', 'yes', 'true'].includes(value)) return usesCensorCoding ? false : true;
+  if (['event', 'death', 'dead', 'progressed', 'progression', 'failure'].some((token) => value.includes(token))) {
+    return true;
+  }
+  if (['censored', 'alive', 'ongoing', 'no event'].some((token) => value.includes(token))) {
+    return false;
+  }
+
+  return null;
+};
+
+const inferSurvivalEndpointLabel = (rows: CsvRow[], headers: string[], timeVar: string): string => {
+  const parameterLabelColumn = findHeaderByHints(headers, ['PARAM', 'PARAMCD']);
+  if (parameterLabelColumn) {
+    const values = Array.from(new Set(rows.map((row) => (row[parameterLabelColumn] || '').trim()).filter(Boolean)));
+    if (values.length === 1) {
+      return formatDisplayName(values[0]);
+    }
+  }
+  return formatDisplayName(timeVar);
+};
+
+const inferSurvivalTimeAxisLabel = (rows: CsvRow[], headers: string[], timeVar: string, endpointLabel: string): string => {
+  const unitColumn =
+    findHeaderByHints(headers, ['AVALU', 'TIMEU', 'UNIT']) ||
+    headers.find((header) => normalizeFieldKey(header) === `${normalizeFieldKey(timeVar)}u`) ||
+    null;
+
+  if (!unitColumn) return endpointLabel;
+
+  const units = Array.from(new Set(rows.map((row) => (row[unitColumn] || '').trim()).filter(Boolean)));
+  if (units.length === 1) {
+    return `${endpointLabel} (${units[0]})`;
+  }
+
+  return endpointLabel;
+};
+
+const extractSurvivalRecords = (
+  rows: CsvRow[],
+  headers: string[],
+  groupVar: string,
+  timeVar: string
+): { records: SurvivalRecord[]; censorColumn: string; endpointLabel: string } => {
+  const censorColumn = inferSurvivalCensorColumn(headers, groupVar, timeVar);
+  if (!censorColumn) {
+    throw new Error('A survival analysis requires a censoring/event column such as CNSR, STATUS, or EVENT.');
+  }
+
+  const records: SurvivalRecord[] = rows
+    .map((row) => {
+      const group = (row[groupVar] || '').trim();
+      const time = toNumber(row[timeVar]);
+      const eventObserved = parseEventObserved(row[censorColumn], censorColumn);
+      if (!group || time == null || time < 0 || eventObserved == null) return null;
+      return { group, time, event: eventObserved, covariate: Number.NaN };
+    })
+    .filter((record): record is SurvivalRecord => Boolean(record));
+
+  if (records.length < 3) {
+    throw new Error('A survival analysis requires at least three valid rows with group, time, and censoring values.');
+  }
+
+  return {
+    records,
+    censorColumn,
+    endpointLabel: inferSurvivalEndpointLabel(rows, headers, timeVar),
+  };
+};
+
+const buildKaplanMeierCurve = (records: SurvivalRecord[]): KaplanMeierCurve => {
+  const sortedRecords = [...records].sort((left, right) => left.time - right.time);
+  const uniqueTimes = Array.from(new Set(sortedRecords.map((record) => record.time))).sort((a, b) => a - b);
+  let survival = 1;
+  const x = [0];
+  const y = [1];
+  const censorX: number[] = [];
+  const censorY: number[] = [];
+  let medianSurvival: number | null = null;
+
+  uniqueTimes.forEach((time) => {
+    const atRisk = sortedRecords.filter((record) => record.time >= time).length;
+    const events = sortedRecords.filter((record) => record.time === time && record.event).length;
+    const censored = sortedRecords.filter((record) => record.time === time && !record.event).length;
+
+    if (events > 0 && atRisk > 0) {
+      x.push(time);
+      y.push(survival);
+      survival *= 1 - events / atRisk;
+      x.push(time);
+      y.push(survival);
+      if (medianSurvival == null && survival <= 0.5) {
+        medianSurvival = time;
+      }
+    }
+
+    if (censored > 0) {
+      censorX.push(...Array.from({ length: censored }, () => time));
+      censorY.push(...Array.from({ length: censored }, () => survival));
+    }
+  });
+
+  const events = sortedRecords.filter((record) => record.event).length;
+  const censored = sortedRecords.length - events;
+
+  return {
+    x,
+    y,
+    censorX,
+    censorY,
+    n: sortedRecords.length,
+    events,
+    censored,
+    medianSurvival,
+  };
+};
+
+const invertMatrix = (matrix: number[][]): number[][] | null => {
+  const size = matrix.length;
+  if (size === 0) return [];
+
+  const augmented = matrix.map((row, rowIndex) => [
+    ...row.map((value) => (Number.isFinite(value) ? value : 0)),
+    ...Array.from({ length: size }, (_, colIndex) => (rowIndex === colIndex ? 1 : 0)),
+  ]);
+
+  for (let pivotIndex = 0; pivotIndex < size; pivotIndex += 1) {
+    let pivotRow = pivotIndex;
+    while (pivotRow < size && Math.abs(augmented[pivotRow][pivotIndex]) < 1e-12) {
+      pivotRow += 1;
+    }
+    if (pivotRow === size) return null;
+
+    if (pivotRow !== pivotIndex) {
+      [augmented[pivotIndex], augmented[pivotRow]] = [augmented[pivotRow], augmented[pivotIndex]];
+    }
+
+    const pivot = augmented[pivotIndex][pivotIndex];
+    if (!Number.isFinite(pivot) || Math.abs(pivot) < 1e-12) return null;
+
+    for (let col = 0; col < size * 2; col += 1) {
+      augmented[pivotIndex][col] /= pivot;
+    }
+
+    for (let row = 0; row < size; row += 1) {
+      if (row === pivotIndex) continue;
+      const factor = augmented[row][pivotIndex];
+      for (let col = 0; col < size * 2; col += 1) {
+        augmented[row][col] -= factor * augmented[pivotIndex][col];
+      }
+    }
+  }
+
+  return augmented.map((row) => row.slice(size));
+};
+
+const multiplyMatrixVector = (matrix: number[][], vector: number[]) =>
+  matrix.map((row) => row.reduce((sum, value, index) => sum + value * vector[index], 0));
+
+const computeLogRank = (records: SurvivalRecord[]) => {
+  const groups = Array.from(new Set(records.map((record) => record.group)));
+  if (groups.length < 2) {
+    throw new Error('Kaplan-Meier / Log-Rank requires at least two groups.');
+  }
+
+  const uniqueEventTimes = Array.from(
+    new Set(records.filter((record) => record.event).map((record) => record.time))
+  ).sort((a, b) => a - b);
+
+  const observed = new Array(groups.length).fill(0);
+  const expected = new Array(groups.length).fill(0);
+  const covariance = Array.from({ length: groups.length - 1 }, () =>
+    new Array(groups.length - 1).fill(0)
+  );
+
+  uniqueEventTimes.forEach((time) => {
+    const atRisk = groups.map(
+      (group) => records.filter((record) => record.group === group && record.time >= time).length
+    );
+    const events = groups.map(
+      (group) => records.filter((record) => record.group === group && record.time === time && record.event).length
+    );
+
+    const totalAtRisk = atRisk.reduce((sum, value) => sum + value, 0);
+    const totalEvents = events.reduce((sum, value) => sum + value, 0);
+    if (totalAtRisk <= 0 || totalEvents <= 0) return;
+
+    groups.forEach((_, index) => {
+      observed[index] += events[index];
+      expected[index] += (atRisk[index] * totalEvents) / totalAtRisk;
+    });
+
+    if (totalAtRisk <= 1) return;
+    const factor = (totalEvents * (totalAtRisk - totalEvents)) / (totalAtRisk * totalAtRisk * (totalAtRisk - 1));
+
+    for (let row = 0; row < groups.length - 1; row += 1) {
+      covariance[row][row] += factor * atRisk[row] * (totalAtRisk - atRisk[row]);
+      for (let col = row + 1; col < groups.length - 1; col += 1) {
+        const cov = -factor * atRisk[row] * atRisk[col];
+        covariance[row][col] += cov;
+        covariance[col][row] += cov;
+      }
+    }
+  });
+
+  const oe = observed.slice(0, -1).map((value, index) => value - expected[index]);
+  const inverse = invertMatrix(covariance);
+  if (!inverse) {
+    throw new Error('Unable to compute a stable log-rank variance matrix for these groups.');
+  }
+
+  const weighted = multiplyMatrixVector(inverse, oe);
+  const statistic = oe.reduce((sum, value, index) => sum + value * weighted[index], 0);
+  const degreesOfFreedom = groups.length - 1;
+  const pValue = 1 - jStat.chisquare.cdf(statistic, degreesOfFreedom);
+
+  return { groups, statistic, degreesOfFreedom, pValue };
+};
+
+const runKaplanMeier = (rows: CsvRow[], headers: string[], groupVar: string, timeVar: string): StatAnalysisResult => {
+  const { records, endpointLabel, censorColumn } = extractSurvivalRecords(rows, headers, groupVar, timeVar);
+  const groupNames = Array.from(new Set(records.map((record) => record.group)));
+
+  if (groupNames.length > 6) {
+    throw new Error('Kaplan-Meier requires a categorical grouping variable with a manageable number of groups.');
+  }
+
+  const curves = groupNames.map((group) => ({
+    group,
+    curve: buildKaplanMeierCurve(records.filter((record) => record.group === group)),
+  }));
+  const logRank = computeLogRank(records);
+  const groupLabel = formatDisplayName(groupVar);
+  const timeLabel = inferSurvivalTimeAxisLabel(rows, headers, timeVar, endpointLabel);
+
+  const chartConfig = {
+    data: curves.flatMap(({ group, curve }, index) => {
+      const color = KAPLAN_MEIER_COLORS[index % KAPLAN_MEIER_COLORS.length];
+      const traces: Record<string, any>[] = [
+        {
+          type: 'scatter',
+          mode: 'lines',
+          name: group,
+          x: curve.x,
+          y: curve.y,
+          line: { shape: 'hv', width: 3, color },
+          legendgroup: group,
+          hovertemplate: `${group}<br>Time: %{x}<br>Survival: %{y:.1%}<extra></extra>`,
+        },
+      ];
+
+      if (curve.censorX.length > 0) {
+        traces.push({
+          type: 'scatter',
+          mode: 'markers',
+          name: `${group} censored`,
+          x: curve.censorX,
+          y: curve.censorY,
+          marker: { symbol: 'line-ns-open', size: 8, color, opacity: 0.8, line: { color, width: 1 } },
+          legendgroup: group,
+          showlegend: false,
+          hovertemplate: `${group}<br>Censored at %{x}<br>Survival: %{y:.1%}<extra></extra>`,
+        });
+      }
+
+      return traces;
+    }),
+    layout: {
+      title: formatChartTitle(`Kaplan-Meier: ${endpointLabel} by ${groupLabel}`),
+      xaxis: { title: timeLabel },
+      yaxis: { title: 'Survival Probability', tickformat: '.0%', range: [0, 1] },
+      hovermode: 'x unified',
+    },
+  };
+
+  const tableConfig: ResultTable = {
+    title: `Kaplan-Meier summary for ${endpointLabel}`,
+    columns: ['group', 'n', 'events', 'censored', 'median_survival'],
+    rows: curves.map(({ group, curve }) => ({
+      group,
+      n: curve.n,
+      events: curve.events,
+      censored: curve.censored,
+      median_survival: curve.medianSurvival == null ? 'Not reached' : curve.medianSurvival.toFixed(2),
+    })),
+  };
+
+  return {
+    metrics: {
+      test: 'Kaplan-Meier / Log-Rank',
+      groups: groupNames.length,
+      total_n: records.length,
+      total_events: records.filter((record) => record.event).length,
+      total_censored: records.filter((record) => !record.event).length,
+      censor_column: censorColumn,
+      log_rank_statistic: logRank.statistic.toFixed(4),
+      degrees_of_freedom: logRank.degreesOfFreedom,
+      p_value: formatPValue(logRank.pValue),
+    },
+    interpretation:
+      logRank.pValue < 0.05
+        ? `Kaplan-Meier analysis detected a statistically significant difference in ${endpointLabel.toLowerCase()} across ${groupLabel} groups (log-rank p=${formatPValue(logRank.pValue)}).`
+        : `Kaplan-Meier analysis did not detect a statistically significant difference in ${endpointLabel.toLowerCase()} across ${groupLabel} groups (log-rank p=${formatPValue(logRank.pValue)}).`,
+    chartConfig,
+    tableConfig,
+    executedCode: `# Deterministic local execution\n# Kaplan-Meier / Log-Rank ${timeVar} by ${groupVar}`,
+  };
+};
+
+const encodeCoxCovariate = (
+  records: SurvivalRecord[],
+  rows: CsvRow[],
+  groupVar: string
+): { encoded: SurvivalRecord[]; label: string; reference?: string; comparison?: string } => {
+  const values = rows.map((row) => (row[groupVar] || '').trim()).filter(Boolean);
+  const numericValues = values.map((value) => toNumber(value));
+  const numericCoverage = numericValues.filter((value) => value != null).length;
+
+  if (numericCoverage === values.length) {
+    const covariateMap = new Map<string, number>();
+    values.forEach((value) => covariateMap.set(value, Number(value)));
+    return {
+      encoded: records.map((record) => ({
+        ...record,
+        covariate: covariateMap.get(record.group) as number,
+      })),
+      label: `${formatDisplayName(groupVar)} (per unit increase)`,
+    };
+  }
+
+  const distinctGroups = Array.from(new Set(values)).sort((left, right) => left.localeCompare(right));
+  if (distinctGroups.length !== 2) {
+    throw new Error('Cox proportional hazards is currently limited to a numeric covariate or a binary grouping variable.');
+  }
+
+  const [reference, comparison] = distinctGroups;
+  return {
+    encoded: records.map((record) => ({
+      ...record,
+      covariate: record.group === comparison ? 1 : 0,
+    })),
+    label: `${formatDisplayName(groupVar)} (${comparison} vs ${reference})`,
+    reference,
+    comparison,
+  };
+};
+
+const runCox = (rows: CsvRow[], headers: string[], groupVar: string, timeVar: string): StatAnalysisResult => {
+  const { records, endpointLabel, censorColumn } = extractSurvivalRecords(rows, headers, groupVar, timeVar);
+  const events = records.filter((record) => record.event);
+  if (events.length < 3) {
+    throw new Error('Cox proportional hazards requires at least three observed events.');
+  }
+
+  const encoded = encodeCoxCovariate(records, rows, groupVar);
+  const eventTimes = Array.from(new Set(encoded.encoded.filter((record) => record.event).map((record) => record.time))).sort((a, b) => a - b);
+
+  let beta = 0;
+  for (let iteration = 0; iteration < 50; iteration += 1) {
+    let score = 0;
+    let information = 0;
+
+    eventTimes.forEach((time) => {
+      const riskSet = encoded.encoded.filter((record) => record.time >= time);
+      const eventSet = encoded.encoded.filter((record) => record.time === time && record.event);
+      const d = eventSet.length;
+      if (d === 0) return;
+
+      const weights = riskSet.map((record) => Math.exp(beta * record.covariate));
+      const sumWeights = weights.reduce((sum, value) => sum + value, 0);
+      const sumWeightedX = riskSet.reduce((sum, record) => sum + record.covariate * Math.exp(beta * record.covariate), 0);
+      const sumWeightedX2 = riskSet.reduce(
+        (sum, record) => sum + record.covariate * record.covariate * Math.exp(beta * record.covariate),
+        0
+      );
+      const eventX = eventSet.reduce((sum, record) => sum + record.covariate, 0);
+
+      score += eventX - d * (sumWeightedX / sumWeights);
+      information += d * (sumWeightedX2 / sumWeights - (sumWeightedX / sumWeights) ** 2);
+    });
+
+    if (!Number.isFinite(information) || information <= 1e-12) {
+      throw new Error('Unable to estimate a stable Cox proportional hazards model for the selected variable.');
+    }
+
+    const step = score / information;
+    beta += step;
+    if (Math.abs(step) < 1e-8) break;
+  }
+
+  let finalInformation = 0;
+  eventTimes.forEach((time) => {
+    const riskSet = encoded.encoded.filter((record) => record.time >= time);
+    const eventSet = encoded.encoded.filter((record) => record.time === time && record.event);
+    const d = eventSet.length;
+    if (d === 0) return;
+    const sumWeights = riskSet.reduce((sum, record) => sum + Math.exp(beta * record.covariate), 0);
+    const sumWeightedX = riskSet.reduce((sum, record) => sum + record.covariate * Math.exp(beta * record.covariate), 0);
+    const sumWeightedX2 = riskSet.reduce(
+      (sum, record) => sum + record.covariate * record.covariate * Math.exp(beta * record.covariate),
+      0
+    );
+    finalInformation += d * (sumWeightedX2 / sumWeights - (sumWeightedX / sumWeights) ** 2);
+  });
+
+  if (!Number.isFinite(finalInformation) || finalInformation <= 1e-12) {
+    throw new Error('Unable to estimate uncertainty for the Cox proportional hazards model.');
+  }
+
+  const standardError = Math.sqrt(1 / finalInformation);
+  const zStatistic = beta / standardError;
+  const pValue = 2 * (1 - jStat.normal.cdf(Math.abs(zStatistic), 0, 1));
+  const hazardRatio = Math.exp(beta);
+  const ciLower = Math.exp(beta - 1.96 * standardError);
+  const ciUpper = Math.exp(beta + 1.96 * standardError);
+  const covariateLabel = encoded.label;
+
+  return {
+    metrics: {
+      test: 'Cox Proportional Hazards',
+      n: encoded.encoded.length,
+      events: events.length,
+      censor_column: censorColumn,
+      coefficient_beta: beta.toFixed(4),
+      standard_error: standardError.toFixed(4),
+      hazard_ratio: hazardRatio.toFixed(4),
+      ci_lower_95: ciLower.toFixed(4),
+      ci_upper_95: ciUpper.toFixed(4),
+      z_statistic: zStatistic.toFixed(4),
+      p_value: formatPValue(pValue),
+      ...(encoded.reference && encoded.comparison
+        ? {
+            reference_group: encoded.reference,
+            comparison_group: encoded.comparison,
+          }
+        : {}),
+    },
+    interpretation:
+      pValue < 0.05
+        ? `Cox proportional hazards modeling detected a statistically significant hazard difference for ${endpointLabel.toLowerCase()} using ${covariateLabel} (HR=${hazardRatio.toFixed(2)}, p=${formatPValue(pValue)}).`
+        : `Cox proportional hazards modeling did not detect a statistically significant hazard difference for ${endpointLabel.toLowerCase()} using ${covariateLabel} (HR=${hazardRatio.toFixed(2)}, p=${formatPValue(pValue)}).`,
+    chartConfig: {
+      data: [
+        {
+          type: 'scatter',
+          mode: 'markers',
+          x: [hazardRatio],
+          y: [covariateLabel],
+          marker: { size: 14, color: hazardRatio >= 1 ? '#dc2626' : '#2563eb' },
+          error_x: {
+            type: 'data',
+            visible: true,
+            array: [ciUpper - hazardRatio],
+            arrayminus: [hazardRatio - ciLower],
+          },
+          hovertemplate: `${covariateLabel}<br>HR=%{x:.2f}<br>95% CI ${ciLower.toFixed(2)}-${ciUpper.toFixed(2)}<extra></extra>`,
+        },
+      ],
+      layout: {
+        title: formatChartTitle(`Cox model: ${endpointLabel}`),
+        xaxis: { title: 'Hazard ratio', zeroline: false },
+        yaxis: { automargin: true },
+        shapes: [
+          {
+            type: 'line',
+            x0: 1,
+            x1: 1,
+            y0: -0.5,
+            y1: 0.5,
+            line: { color: '#94a3b8', dash: 'dash' },
+          },
+        ],
+      },
+    },
+    tableConfig: {
+      title: `Cox proportional hazards summary for ${endpointLabel}`,
+      columns: ['covariate', 'hazard_ratio', 'ci_95', 'p_value'],
+      rows: [
+        {
+          covariate: covariateLabel,
+          hazard_ratio: hazardRatio.toFixed(4),
+          ci_95: `${ciLower.toFixed(4)} to ${ciUpper.toFixed(4)}`,
+          p_value: formatPValue(pValue),
+        },
+      ],
+    },
+    executedCode: `# Deterministic local execution\n# Cox proportional hazards ${timeVar} ~ ${groupVar}`,
+  };
+};
 
 const runTTest = (rows: CsvRow[], groupVar: string, outcomeVar: string): StatAnalysisResult => {
   const grouped = buildGroupedNumeric(rows, groupVar, outcomeVar);
@@ -519,7 +1065,7 @@ export const executeLocalStatisticalAnalysis = (
   var2: string,
   concept?: AnalysisConcept | null
 ): StatAnalysisResult => {
-  const { rows } = parseCsv(file.content);
+  const { headers, rows } = parseCsv(file.content);
   if (rows.length === 0) {
     throw new Error('Dataset is empty.');
   }
@@ -542,6 +1088,10 @@ export const executeLocalStatisticalAnalysis = (
       return runRegression(rows, var1, outcomeVar);
     case StatTestType.CORRELATION:
       return runCorrelation(rows, var1, outcomeVar);
+    case StatTestType.KAPLAN_MEIER:
+      return runKaplanMeier(rows, headers, var1, outcomeVar);
+    case StatTestType.COX_PH:
+      return runCox(rows, headers, var1, outcomeVar);
     default:
       throw new Error(`Unsupported test type: ${normalizedTestType}`);
   }

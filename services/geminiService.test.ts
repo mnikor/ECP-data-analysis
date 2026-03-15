@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { ClinicalFile, DataType, QCIssue, StatTestType } from '../types';
 import {
+  buildChatContextText,
+  buildTabularChatContext,
   executeStatisticalCode,
   extractCohortFiltersFromProtocol,
   extractPreSpecifiedAnalysisPlan,
+  generateAnalysis,
   generateCleaningSuggestion,
   runQualityCheck,
 } from './geminiService';
@@ -99,6 +102,120 @@ describe('executeStatisticalCode', () => {
     await expect(
       executeStatisticalCode('print("run")', badFile, StatTestType.T_TEST, 'ARM', 'CHG_SCORE')
     ).rejects.toThrow('T-Test requires exactly two groups');
+  });
+});
+
+describe('generateAnalysis', () => {
+  it('runs deterministic exploratory analysis in chat for a single selected tabular dataset', async () => {
+    const response = await generateAnalysis(
+      'Compare age by arm and show the distribution',
+      [
+        {
+          id: 'chat_dm',
+          name: 'dm.csv',
+          type: DataType.RAW,
+          uploadDate: new Date().toISOString(),
+          size: '1 KB',
+          content: [
+            'ARM,AGE',
+            'Placebo,61',
+            'Placebo,59',
+            'Active,66',
+            'Active,70',
+          ].join('\n'),
+        },
+      ],
+      'RAG',
+      []
+    );
+
+    expect(response.answer).toMatch(/Exploratory analysis executed/i);
+    expect(response.chartConfig).toBeTruthy();
+    expect(response.tableConfig).toBeTruthy();
+    expect(response.keyInsights?.[0]).toMatch(/deterministic exploratory/i);
+  });
+
+  it('runs Kaplan-Meier exploratory analysis in chat when an ADTTE dataset is selected', async () => {
+    const response = await generateAnalysis(
+      'Compare overall survival between treatment arms',
+      [
+        {
+          id: 'chat_adtte',
+          name: 'adtte.csv',
+          type: DataType.STANDARDIZED,
+          uploadDate: new Date().toISOString(),
+          size: '1 KB',
+          content: [
+            'USUBJID,TRT01A,PARAMCD,PARAM,AVAL,CNSR',
+            '01,DrugA,OS,Overall Survival,10,0',
+            '02,DrugA,OS,Overall Survival,12,1',
+            '03,DrugB,OS,Overall Survival,8,0',
+            '04,DrugB,OS,Overall Survival,14,1',
+          ].join('\n'),
+        },
+      ],
+      'RAG',
+      []
+    );
+
+    expect(response.answer).toMatch(/Kaplan-Meier/i);
+    expect(response.chartConfig?.layout?.title?.text).toMatch(/Kaplan-Meier/i);
+    expect(response.tableConfig?.columns).toContain('median_survival');
+  });
+});
+
+describe('chat context building', () => {
+  it('summarizes full tabular survival context instead of using a short fragment', () => {
+    const context = buildTabularChatContext({
+      id: 'chat_survival_context',
+      name: 'adtte.csv',
+      type: DataType.STANDARDIZED,
+      uploadDate: new Date().toISOString(),
+      size: '1 KB',
+      content: [
+        'USUBJID,TRT01A,PARAMCD,PARAM,AVAL,CNSR',
+        '01,DrugA,OS,Overall Survival,10,0',
+        '02,DrugA,OS,Overall Survival,12,1',
+        '03,DrugB,OS,Overall Survival,8,0',
+        '04,DrugB,OS,Overall Survival,14,1',
+      ].join('\n'),
+    });
+
+    expect(context).toContain('Rows: 4');
+    expect(context).toContain('Unique subjects (USUBJID): 4');
+    expect(context).toContain('Treatment/group summary: TRT01A: DrugA (2), DrugB (2)');
+    expect(context).toContain('Candidate time endpoint summary: AVAL: n=4');
+    expect(context).toContain('Candidate censor/event summary: CNSR: 0 (2), 1 (2)');
+    expect(context).toContain('Use these full-dataset counts and summaries');
+  });
+
+  it('uses structured tabular summaries in RAG mode instead of first-row fragments', () => {
+    const context = buildChatContextText(
+      [
+        {
+          id: 'chat_dm_context',
+          name: 'dm.csv',
+          type: DataType.STANDARDIZED,
+          uploadDate: new Date().toISOString(),
+          size: '1 KB',
+          content: [
+            'USUBJID,TRT01A,AGE,SEX',
+            '01,DrugA,60,M',
+            '02,DrugA,61,F',
+            '03,DrugB,58,M',
+            '04,DrugB,57,F',
+          ].join('\n'),
+        },
+        protocolFile,
+      ],
+      'RAG'
+    );
+
+    expect(context).toContain('RETRIEVED CONTEXT:');
+    expect(context).toContain('TABULAR DATASET PROFILE');
+    expect(context).toContain('Rows: 4');
+    expect(context).toContain('[Source: Protocol.txt]:');
+    expect(context).not.toContain('RETRIEVED FRAGMENTS:');
   });
 });
 
@@ -205,6 +322,64 @@ describe('runQualityCheck', () => {
 
     expect(result.status).toBe('PASS');
     expect(missingColumnIssue).toBeUndefined();
+  });
+
+  it('recognizes ADSL as an ADaM subject-level dataset without failing generic raw checks', async () => {
+    const file: ClinicalFile = {
+      id: 'qc_adsl',
+      name: 'adsl.csv',
+      type: DataType.STANDARDIZED,
+      uploadDate: new Date().toISOString(),
+      size: '1 KB',
+      content: [
+        'USUBJID,TRT01A,AGE,SEX,ITTFL',
+        '01,DrugA,65,M,Y',
+        '02,DrugB,59,F,Y',
+      ].join('\n'),
+    };
+
+    const result = await runQualityCheck(file);
+
+    expect(result.status).toBe('PASS');
+    expect(result.issues).toHaveLength(0);
+  });
+
+  it('warns when ADLB contains multiple parameters without an analysis flag', async () => {
+    const file: ClinicalFile = {
+      id: 'qc_adlb',
+      name: 'adlb.csv',
+      type: DataType.STANDARDIZED,
+      uploadDate: new Date().toISOString(),
+      size: '1 KB',
+      content: [
+        'USUBJID,TRT01A,PARAMCD,PARAM,AVAL,AVISIT',
+        '01,DrugA,HGB,Hemoglobin,13.1,Week 1',
+        '01,DrugA,ALT,Alanine Aminotransferase,32.4,Week 1',
+      ].join('\n'),
+    };
+
+    const result = await runQualityCheck(file);
+    expect(result.status).toBe('WARN');
+    expect(result.issues.some((issue) => /analysis parameters|multiple parameters/i.test(issue.description))).toBe(true);
+  });
+
+  it('warns that ADTTE needs censoring and population review before survival interpretation', async () => {
+    const file: ClinicalFile = {
+      id: 'qc_adtte',
+      name: 'adtte.csv',
+      type: DataType.STANDARDIZED,
+      uploadDate: new Date().toISOString(),
+      size: '1 KB',
+      content: [
+        'USUBJID,TRT01A,PARAMCD,PARAM,AVAL,CNSR',
+        '01,DrugA,OS,Overall Survival,12,0',
+        '02,DrugB,OS,Overall Survival,10,1',
+      ].join('\n'),
+    };
+
+    const result = await runQualityCheck(file);
+    expect(result.status).toBe('WARN');
+    expect(result.issues.some((issue) => /censoring semantics|Kaplan-Meier|Cox/i.test(issue.description))).toBe(true);
   });
 });
 

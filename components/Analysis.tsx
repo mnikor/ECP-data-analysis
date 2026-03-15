@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { Send, Bot, User, FileText, CheckSquare, Search, BookOpen, Lightbulb, TrendingUp, AlertTriangle, Sparkles, Download, GitMerge, Users } from 'lucide-react';
+import { Send, Bot, User, FileText, CheckSquare, Search, BookOpen, Lightbulb, TrendingUp, AlertTriangle, Sparkles, Download, GitMerge, Users, Activity } from 'lucide-react';
 import { ClinicalFile, DataType, ChatMessage, AnalysisMode, ProvenanceRecord, ProvenanceType } from '../types';
 import { generateAnalysis } from '../services/geminiService';
 import { Chart } from './Chart';
@@ -21,6 +21,175 @@ const QUICK_ACTION_ICONS: Record<ChatQuickActionIcon, React.ComponentType<{ clas
   BIOMARKER: Sparkles,
   LINKED: GitMerge,
   DEMOGRAPHICS: Users,
+  TIME_TO_EVENT: Activity,
+};
+
+const INLINE_TOKEN_REGEX = /(\*\*[^*]+\*\*|`[^`]+`)/g;
+
+const renderInlineTokens = (text: string): React.ReactNode[] =>
+  text.split(INLINE_TOKEN_REGEX).filter(Boolean).map((token, index) => {
+    if (token.startsWith('**') && token.endsWith('**')) {
+      return <strong key={index} className="font-semibold text-slate-900">{token.slice(2, -2)}</strong>;
+    }
+    if (token.startsWith('`') && token.endsWith('`')) {
+      return <code key={index} className="rounded bg-slate-100 px-1.5 py-0.5 text-[0.92em] text-slate-700">{token.slice(1, -1)}</code>;
+    }
+    return token;
+  });
+
+const escapeHtml = (text: string): string =>
+  text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+const formatInlineHtml = (text: string): string =>
+  escapeHtml(text).replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>');
+
+const renderFormattedMessage = (content: string): React.ReactNode[] => {
+  const lines = content.split('\n');
+  const blocks: React.ReactNode[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i].trim();
+
+    if (!line) {
+      i += 1;
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,4})\s+(.*)$/);
+    if (headingMatch) {
+      const level = Math.min(headingMatch[1].length, 4);
+      const headingText = headingMatch[2].trim();
+      const className =
+        level === 1 ? 'text-xl font-bold text-slate-900 mt-1' :
+        level === 2 ? 'text-lg font-bold text-slate-900 mt-1' :
+        'text-base font-semibold text-slate-900 mt-1';
+      blocks.push(
+        <div key={`heading-${i}`} className={className}>
+          {renderInlineTokens(headingText)}
+        </div>
+      );
+      i += 1;
+      continue;
+    }
+
+    if (/^[-*]\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length) {
+        const current = lines[i].trim();
+        if (!current) break;
+        const bulletMatch = current.match(/^[-*]\s+(.*)$/);
+        if (bulletMatch) {
+          items.push(bulletMatch[1]);
+          i += 1;
+          continue;
+        }
+        if (items.length > 0) {
+          items[items.length - 1] += ` ${current}`;
+          i += 1;
+          continue;
+        }
+        break;
+      }
+
+      blocks.push(
+        <ul key={`list-${i}`} className="my-3 list-disc space-y-2 pl-5 text-sm text-slate-800">
+          {items.map((item, index) => (
+            <li key={index} className="leading-relaxed">{renderInlineTokens(item)}</li>
+          ))}
+        </ul>
+      );
+      continue;
+    }
+
+    const paragraphLines: string[] = [line];
+    i += 1;
+    while (i < lines.length) {
+      const current = lines[i].trim();
+      if (!current) {
+        i += 1;
+        break;
+      }
+      if (/^(#{1,4})\s+/.test(current) || /^[-*]\s+/.test(current)) break;
+      paragraphLines.push(current);
+      i += 1;
+    }
+
+    blocks.push(
+      <p key={`paragraph-${i}`} className="my-3 text-sm leading-relaxed text-slate-800">
+        {renderInlineTokens(paragraphLines.join(' '))}
+      </p>
+    );
+  }
+
+  return blocks;
+};
+
+const formatMessageAsHtml = (content: string): string => {
+  const lines = content.split('\n');
+  const htmlBlocks: string[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i].trim();
+
+    if (!line) {
+      i += 1;
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,4})\s+(.*)$/);
+    if (headingMatch) {
+      const level = Math.min(headingMatch[1].length + 1, 5);
+      htmlBlocks.push(`<h${level}>${formatInlineHtml(headingMatch[2].trim())}</h${level}>`);
+      i += 1;
+      continue;
+    }
+
+    if (/^[-*]\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length) {
+        const current = lines[i].trim();
+        if (!current) break;
+        const bulletMatch = current.match(/^[-*]\s+(.*)$/);
+        if (bulletMatch) {
+          items.push(bulletMatch[1]);
+          i += 1;
+          continue;
+        }
+        if (items.length > 0) {
+          items[items.length - 1] += ` ${current}`;
+          i += 1;
+          continue;
+        }
+        break;
+      }
+      htmlBlocks.push(`<ul>${items.map((item) => `<li>${formatInlineHtml(item)}</li>`).join('')}</ul>`);
+      continue;
+    }
+
+    const paragraphLines: string[] = [line];
+    i += 1;
+    while (i < lines.length) {
+      const current = lines[i].trim();
+      if (!current) {
+        i += 1;
+        break;
+      }
+      if (/^(#{1,4})\s+/.test(current) || /^[-*]\s+/.test(current)) break;
+      paragraphLines.push(current);
+      i += 1;
+    }
+
+    htmlBlocks.push(`<p>${formatInlineHtml(paragraphLines.join(' '))}</p>`);
+  }
+
+  return htmlBlocks.join('');
 };
 
 export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, messages, setMessages }) => {
@@ -107,6 +276,7 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
       content: response.answer,
       timestamp: new Date().toISOString(),
       chartConfig: response.chartConfig,
+      tableConfig: response.tableConfig,
       keyInsights: response.keyInsights
     };
 
@@ -138,6 +308,28 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
           </script>
       ` : '';
 
+      const resultTable = msg.tableConfig ? `
+          <div style="margin-top:30px;">
+            <span class="label" style="display:block; margin-bottom:10px;">Result Table</span>
+            <div style="overflow:auto; border:1px solid #e2e8f0; border-radius:8px;">
+              <table style="width:100%; border-collapse:collapse; font-size:0.95em;">
+                <thead>
+                  <tr>
+                    ${msg.tableConfig.columns.map((column) => `<th style="text-align:left; padding:12px; background:#f8fafc; border-bottom:1px solid #e2e8f0;">${escapeHtml(column)}</th>`).join('')}
+                  </tr>
+                </thead>
+                <tbody>
+                  ${msg.tableConfig.rows.map((row) => `
+                    <tr>
+                      ${msg.tableConfig!.columns.map((column) => `<td style="padding:12px; border-bottom:1px solid #f1f5f9;">${escapeHtml(String(row[column] ?? ''))}</td>`).join('')}
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            </div>
+          </div>
+      ` : '';
+
       const content = `
         <!DOCTYPE html>
         <html>
@@ -150,7 +342,15 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
             .meta { background: #f8fafc; padding: 15px; border-radius: 8px; border: 1px solid #e2e8f0; margin-bottom: 30px; font-size: 0.9em; }
             .label { font-weight: bold; color: #64748b; text-transform: uppercase; font-size: 0.75em; letter-spacing: 0.05em; }
             .query-box { background: #f0f9ff; padding: 15px; border-left: 4px solid #0ea5e9; margin-bottom: 30px; font-style: italic; }
-            .content { white-space: pre-wrap; font-size: 1.05em; }
+            .content { font-size: 1.05em; }
+            .content h2, .content h3, .content h4, .content h5 { color: #0f172a; margin: 1.1em 0 0.45em; line-height: 1.25; }
+            .content h2 { font-size: 1.35em; }
+            .content h3 { font-size: 1.15em; }
+            .content h4, .content h5 { font-size: 1.05em; }
+            .content p { margin: 0 0 1em; }
+            .content ul { margin: 0 0 1em 1.25em; padding: 0; }
+            .content li { margin-bottom: 0.4em; }
+            .content code { background: #f1f5f9; padding: 0.1em 0.35em; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.92em; }
             .insight-box { margin-top: 30px; background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 8px; padding: 20px; }
             .insight-box h3 { margin-top: 0; color: #4338ca; font-size: 1.1em; display: flex; align-items: center; }
             ul { margin: 0; padding-left: 20px; }
@@ -170,7 +370,7 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
           <div class="query-box">"${userQuery}"</div>
           
           <div><span class="label">Analysis Result</span></div>
-          <div class="content">${msg.content}</div>
+          <div class="content">${formatMessageAsHtml(msg.content)}</div>
 
           ${msg.keyInsights ? `
             <div class="insight-box">
@@ -181,6 +381,7 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
 
           ${msg.chartConfig ? `<div><span class="label" style="display:block; margin-top:30px;">Visual Data</span></div>` : ''}
           ${chartScript}
+          ${resultTable}
           
           <div style="margin-top: 50px; border-top: 1px solid #e2e8f0; padding-top: 20px; color: #94a3b8; font-size: 0.8em; text-align: center;">
              Generated by Evidence CoPilot
@@ -277,12 +478,46 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
                     ? 'bg-slate-100 text-slate-800 rounded-tr-none' 
                     : 'bg-white border border-slate-200 text-slate-800 rounded-tl-none shadow-sm'
                 }`}>
-                  <div className="whitespace-pre-wrap text-sm leading-relaxed font-sans">{msg.content}</div>
+                  <div className="text-sm leading-relaxed font-sans">{renderFormattedMessage(msg.content)}</div>
                   
                   {/* Chart Rendering */}
                   {msg.chartConfig && (
                     <div className="mt-4 mb-4">
                       <Chart data={msg.chartConfig.data} layout={msg.chartConfig.layout} />
+                    </div>
+                  )}
+
+                  {msg.tableConfig && (
+                    <div className="mt-4 overflow-hidden rounded-xl border border-slate-200">
+                      {msg.tableConfig.title && (
+                        <div className="border-b border-slate-200 bg-slate-50 px-4 py-2 text-sm font-semibold text-slate-700">
+                          {msg.tableConfig.title}
+                        </div>
+                      )}
+                      <div className="overflow-x-auto">
+                        <table className="min-w-full divide-y divide-slate-200 text-sm">
+                          <thead className="bg-slate-50">
+                            <tr>
+                              {msg.tableConfig.columns.map((column) => (
+                                <th key={column} className="px-4 py-3 text-left font-semibold uppercase tracking-wide text-slate-500">
+                                  {column}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 bg-white">
+                            {msg.tableConfig.rows.map((row, rowIndex) => (
+                              <tr key={rowIndex}>
+                                {msg.tableConfig!.columns.map((column) => (
+                                  <td key={column} className="px-4 py-3 text-slate-700">
+                                    {String(row[column] ?? '')}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
                     </div>
                   )}
 

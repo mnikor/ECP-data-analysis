@@ -92,4 +92,50 @@ describe('statisticsEngine', () => {
     expect(result.metrics.test).toBe('Chi-Square');
     expect(result.chartConfig.data[0].type).toBe('heatmap');
   });
+
+  it('runs Kaplan-Meier / log-rank on ADTTE-style data', () => {
+    const file = makeFile(
+      [
+        'USUBJID,TRT01A,PARAMCD,PARAM,AVAL,CNSR',
+        '01,DrugA,OS,Overall Survival,12,0',
+        '02,DrugA,OS,Overall Survival,14,0',
+        '03,DrugA,OS,Overall Survival,16,1',
+        '04,DrugA,OS,Overall Survival,18,0',
+        '05,DrugB,OS,Overall Survival,5,0',
+        '06,DrugB,OS,Overall Survival,7,0',
+        '07,DrugB,OS,Overall Survival,8,1',
+        '08,DrugB,OS,Overall Survival,9,0',
+      ].join('\n')
+    );
+
+    const result = executeLocalStatisticalAnalysis(file, StatTestType.KAPLAN_MEIER, 'TRT01A', 'AVAL');
+    expect(result.metrics.test).toBe('Kaplan-Meier / Log-Rank');
+    expect(result.chartConfig.data[0].type).toBe('scatter');
+    expect(result.chartConfig.layout.title.text).toBe('Kaplan-Meier: Overall Survival by Actual Treatment');
+    expect(result.tableConfig?.columns).toContain('median_survival');
+  });
+
+  it('runs a simple Cox proportional hazards model on binary treatment groups', () => {
+    const file = makeFile(
+      [
+        'USUBJID,TRT01A,PARAMCD,PARAM,AVAL,CNSR',
+        '01,DrugA,OS,Overall Survival,5,0',
+        '02,DrugA,OS,Overall Survival,7,0',
+        '03,DrugA,OS,Overall Survival,9,1',
+        '04,DrugA,OS,Overall Survival,12,0',
+        '05,DrugA,OS,Overall Survival,15,1',
+        '06,DrugB,OS,Overall Survival,6,0',
+        '07,DrugB,OS,Overall Survival,8,1',
+        '08,DrugB,OS,Overall Survival,10,0',
+        '09,DrugB,OS,Overall Survival,14,0',
+        '10,DrugB,OS,Overall Survival,16,1',
+      ].join('\n')
+    );
+
+    const result = executeLocalStatisticalAnalysis(file, StatTestType.COX_PH, 'TRT01A', 'AVAL');
+    expect(result.metrics.test).toBe('Cox Proportional Hazards');
+    expect(Number(result.metrics.hazard_ratio)).toBeGreaterThan(0);
+    expect(result.chartConfig.layout.title.text).toBe('Cox model: Overall Survival');
+    expect(result.tableConfig?.columns).toContain('hazard_ratio');
+  });
 });

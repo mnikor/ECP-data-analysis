@@ -41,7 +41,9 @@ export enum StatTestType {
   CHI_SQUARE = 'Chi-Square',
   ANOVA = 'ANOVA',
   REGRESSION = 'Linear Regression',
-  CORRELATION = 'Correlation Analysis'
+  CORRELATION = 'Correlation Analysis',
+  KAPLAN_MEIER = 'Kaplan-Meier / Log-Rank',
+  COX_PH = 'Cox Proportional Hazards'
 }
 
 export enum StatAnalysisStep {
@@ -172,6 +174,7 @@ export interface ResultTable {
 export interface AnalysisResponse {
   answer: string;
   chartConfig?: ChartConfiguration;
+  tableConfig?: ResultTable;
   keyInsights?: string[];
 }
 
@@ -321,6 +324,7 @@ export interface ChatMessage {
   timestamp: string;
   citations?: { sourceId: string; snippet: string }[];
   chartConfig?: ChartConfiguration;
+  tableConfig?: ResultTable;
   keyInsights?: string[];
 }
 

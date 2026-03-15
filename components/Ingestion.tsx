@@ -4,6 +4,7 @@ import { Upload, FileText, Database, Code, Trash2, Activity, AlertTriangle, Chec
 import { ClinicalFile, DataType, QCStatus, QCIssue, CleaningSuggestion } from '../types';
 import { runQualityCheck, generateCleaningSuggestion, applyCleaning } from '../services/geminiService';
 import { parseCsv } from '../utils/dataProcessing';
+import { inferDatasetProfile } from '../utils/datasetProfile';
 import { buildWorkbookSheetPreviews, planWorkbookImport, type WorkbookImportMode, type WorkbookSheetPreview } from '../utils/workbookImport';
 
 // Declare XLSX and PDFJS for TypeScript
@@ -74,6 +75,58 @@ const isIssueAutoFixable = (issue: QCIssue): boolean => {
   return !/missing critical columns|failed to parse dataset/i.test(issue.description);
 };
 
+const isIssueAcknowledgeable = (issue: QCIssue): boolean =>
+  !isIssueAutoFixable(issue) && issue.severity !== 'HIGH';
+
+const getQCStatusFromIssues = (issues: QCIssue[]): QCStatus => {
+  if (issues.length === 0) return 'PASS';
+  return issues.some((issue) => issue.severity === 'HIGH') ? 'FAIL' : 'WARN';
+};
+
+const getAcknowledgedIssueEntry = (issue: QCIssue) => ({
+  ...issue,
+  acknowledgedAt: new Date().toISOString(),
+});
+
+const fileToBase64 = async (file: File): Promise<string> => {
+  const buffer = await file.arrayBuffer();
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+};
+
+const parseSasDataset = async (file: File): Promise<{
+  csvContent: string;
+  format: string;
+  rowCount: number;
+  columnCount: number;
+  columns: string[];
+  tableName?: string;
+  fileLabel?: string;
+}> => {
+  const response = await fetch('/api/ingestion/parse-sas', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      fileName: file.name,
+      base64Data: await fileToBase64(file),
+    }),
+  });
+
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(payload?.error || 'Server failed to parse SAS dataset.');
+  }
+
+  return payload;
+};
+
 export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemoveFile }) => {
   const [activeTab, setActiveTab] = useState<DataType>(DataType.RAW);
   const [dragActive, setDragActive] = useState(false);
@@ -109,6 +162,8 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
   const [fixNotice, setFixNotice] = useState<string | null>(null);
 
   const selectedIssues = selectedQCFile?.qcIssues?.filter((_, idx) => selectedIssueIndices.has(idx)) || [];
+  const selectedAutoFixableIssues = selectedIssues.filter(isIssueAutoFixable);
+  const selectedAcknowledgeableIssues = selectedIssues.filter(isIssueAcknowledgeable);
   const workbookMergeAllowed =
     pendingWorkbookType === DataType.RAW ||
     pendingWorkbookType === DataType.STANDARDIZED ||
@@ -295,11 +350,25 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
                 throw new Error("Invalid JSON file");
             }
         }
-        // CASE 3: PDF Files
+        // CASE 3: SAS Transport / SAS datasets
+        else if (fileName.endsWith('.xpt') || fileName.endsWith('.sas7bdat')) {
+            const parsed = await parseSasDataset(file);
+            content = parsed.csvContent;
+            processedName = file.name.replace(/\.(xpt|sas7bdat)$/i, '.csv');
+            importedMetadata = {
+              sourceFormat: parsed.format,
+              sourceTableName: parsed.tableName || undefined,
+              sourceFileLabel: parsed.fileLabel || undefined,
+              sourceRowCount: parsed.rowCount,
+              sourceColumnCount: parsed.columnCount,
+              sourceColumns: parsed.columns,
+            };
+        }
+        // CASE 4: PDF Files
         else if (fileName.endsWith('.pdf')) {
             content = await extractPdfText(file);
         }
-        // CASE 4: Text/CSV
+        // CASE 5: Text/CSV
         else {
             content = await file.text();
         }
@@ -334,7 +403,15 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
       try {
           const qcResult = await runQualityCheck(file);
           onRemoveFile(file.id);
-          const updatedFile = { ...file, qcStatus: qcResult.status, qcIssues: qcResult.issues };
+          const updatedFile = {
+            ...file,
+            qcStatus: qcResult.status,
+            qcIssues: qcResult.issues,
+            metadata: {
+              ...file.metadata,
+              qcAcknowledgedIssues: [],
+            },
+          };
           onAddFile(updatedFile);
 
           if (qcResult.status !== 'PASS') {
@@ -387,17 +464,17 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
 
   const toggleSelectAll = () => {
     if (!selectedQCFile?.qcIssues) return;
-    const autoFixableIndices = selectedQCFile.qcIssues
-      .map((issue, idx) => (isIssueAutoFixable(issue) ? idx : -1))
+    const actionableIndices = selectedQCFile.qcIssues
+      .map((issue, idx) => (isIssueAutoFixable(issue) || isIssueAcknowledgeable(issue) ? idx : -1))
       .filter((idx) => idx >= 0);
-    const allAutoFixableSelected =
-      autoFixableIndices.length > 0 && autoFixableIndices.every((idx) => selectedIssueIndices.has(idx));
+    const allActionableSelected =
+      actionableIndices.length > 0 && actionableIndices.every((idx) => selectedIssueIndices.has(idx));
 
-    if (allAutoFixableSelected) {
+    if (allActionableSelected) {
         setSelectedIssueIndices(new Set());
     } else {
         const all = new Set<number>();
-        autoFixableIndices.forEach((i) => all.add(i));
+        actionableIndices.forEach((i) => all.add(i));
         setSelectedIssueIndices(all);
     }
   };
@@ -405,22 +482,20 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
   const handleGenerateFix = async () => {
     if (!selectedQCFile || !selectedQCFile.qcIssues) return;
     if (selectedIssues.length === 0) return;
-    const autoFixableSelected = selectedIssues.filter(isIssueAutoFixable);
-    const manualSelected = selectedIssues.filter((issue) => !isIssueAutoFixable(issue));
-    if (autoFixableSelected.length === 0) {
+    if (selectedAutoFixableIssues.length === 0) {
       setFixNotice(null);
-      setApplyError('Selected issues are structural/manual and cannot be auto-fixed. Please remap or re-ingest the source data.');
+      setApplyError('Selected issues are review-only warnings or structural/manual issues. Use acknowledge for advisory warnings or re-ingest/remap the source data for hard failures.');
       return;
     }
     setIsFixing(true);
     setApplyError(null);
     setFixNotice(
-      manualSelected.length > 0
-        ? `${manualSelected.length} selected issue(s) require manual remediation and will be excluded from auto-fix.`
+      selectedIssues.length > selectedAutoFixableIssues.length
+        ? `${selectedIssues.length - selectedAutoFixableIssues.length} selected issue(s) are review-only or manual and will be excluded from auto-fix.`
         : null
     );
     try {
-      const proposal = await generateCleaningSuggestion(selectedQCFile, autoFixableSelected);
+      const proposal = await generateCleaningSuggestion(selectedQCFile, selectedAutoFixableIssues);
       setCleaningProposal(proposal);
     } catch (e) {
       console.error("Failed to generate fix", e);
@@ -428,6 +503,42 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
     } finally {
       setIsFixing(false);
     }
+  };
+
+  const handleAcknowledgeSelected = () => {
+    if (!selectedQCFile?.qcIssues || selectedAcknowledgeableIssues.length === 0) return;
+
+    const acknowledgedEntries = selectedQCFile.qcIssues
+      .filter((issue, idx) => selectedIssueIndices.has(idx) && isIssueAcknowledgeable(issue))
+      .map(getAcknowledgedIssueEntry);
+
+    const remainingIssues = selectedQCFile.qcIssues.filter(
+      (issue, idx) => !(selectedIssueIndices.has(idx) && isIssueAcknowledgeable(issue))
+    );
+
+    const updatedFile: ClinicalFile = {
+      ...selectedQCFile,
+      qcIssues: remainingIssues,
+      qcStatus: getQCStatusFromIssues(remainingIssues),
+      metadata: {
+        ...selectedQCFile.metadata,
+        qcAcknowledgedIssues: [
+          ...((selectedQCFile.metadata?.qcAcknowledgedIssues as Record<string, unknown>[] | undefined) || []),
+          ...acknowledgedEntries,
+        ],
+      },
+    };
+
+    onRemoveFile(selectedQCFile.id);
+    onAddFile(updatedFile);
+    setSelectedQCFile(updatedFile);
+    setSelectedIssueIndices(new Set());
+    setFixNotice(
+      updatedFile.qcStatus === 'PASS'
+        ? `Acknowledged ${acknowledgedEntries.length} advisory issue(s). No unresolved QC issues remain.`
+        : `Acknowledged ${acknowledgedEntries.length} advisory issue(s). Remaining unresolved issues are still shown below.`
+    );
+    setApplyError(null);
   };
 
   const handleApplyFix = async () => {
@@ -460,7 +571,15 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
       setApplyStage('Validating new dataset structure...');
       const qcResult = await runQualityCheck(newFile);
       onRemoveFile(newFile.id);
-      const validatedFile = { ...newFile, qcStatus: qcResult.status, qcIssues: qcResult.issues };
+      const validatedFile = {
+        ...newFile,
+        qcStatus: qcResult.status,
+        qcIssues: qcResult.issues,
+        metadata: {
+          ...newFile.metadata,
+          qcAcknowledgedIssues: [],
+        },
+      };
       onAddFile(validatedFile);
 
       setApplyStage('Finalizing...');
@@ -582,7 +701,7 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
         <p className="text-slate-400 text-sm mb-6">
           {activeTab === DataType.MAPPING
             ? 'Supports CSV/JSON/Excel mapping references (legacy specs, dictionaries, codelists)'
-            : 'Supports CSV, JSON, Excel (.xlsx), PDF (Protocols)'}
+            : 'Supports CSV, JSON, Excel (.xlsx), SAS (.xpt, .sas7bdat), PDF (Protocols)'}
         </p>
         <input 
           type="file" 
@@ -603,7 +722,14 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
       <div className="flex-1 overflow-auto">
         <h3 className="text-lg font-semibold text-slate-800 mb-4">Uploaded Files ({filteredFiles.length})</h3>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filteredFiles.map((file) => (
+          {filteredFiles.map((file) => {
+            const datasetProfile = inferDatasetProfile(file);
+            const showProfileChip =
+              file.type !== DataType.DOCUMENT &&
+              file.type !== DataType.MAPPING &&
+              datasetProfile.kind !== 'GENERIC';
+
+            return (
             <div key={file.id} className="bg-white border border-slate-200 rounded-lg p-4 shadow-sm hover:shadow-md transition-shadow relative group">
               <div className="absolute top-2 right-2 flex space-x-1 bg-white border border-slate-200 rounded-lg shadow-sm p-1 z-10">
                 <button 
@@ -646,6 +772,17 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
                 <div className="overflow-hidden">
                   <h4 className="font-medium text-slate-900 truncate pr-16" title={file.name}>{file.name}</h4>
                   <p className="text-xs text-slate-500">{file.size} • {new Date(file.uploadDate).toLocaleDateString()}</p>
+                  {showProfileChip && (
+                    <div className="mt-2">
+                      <span className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                        datasetProfile.model === 'ADAM'
+                          ? 'border border-indigo-200 bg-indigo-50 text-indigo-700'
+                          : 'border border-slate-200 bg-slate-100 text-slate-600'
+                      }`}>
+                        {datasetProfile.shortLabel}
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
               <div className="flex justify-between items-center mt-2 pt-2 border-t border-slate-50">
@@ -674,7 +811,8 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
                  </div>
               </div>
             </div>
-          ))}
+            );
+          })}
           {filteredFiles.length === 0 && (
             <div className="col-span-full text-center py-12 text-slate-400">
               No files uploaded for this category yet.
@@ -889,7 +1027,28 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
                         </div>
                         <div>
                             <h3 className="font-bold text-slate-800">{previewFile.name}</h3>
-                            <p className="text-xs text-slate-500 uppercase tracking-wider">{previewFile.type} • {previewFile.size}</p>
+                            <div className="flex flex-wrap items-center gap-2 mt-1">
+                              <p className="text-xs text-slate-500 uppercase tracking-wider">{previewFile.type} • {previewFile.size}</p>
+                              {(() => {
+                                const datasetProfile = inferDatasetProfile(previewFile);
+                                if (
+                                  previewFile.type === DataType.DOCUMENT ||
+                                  previewFile.type === DataType.MAPPING ||
+                                  datasetProfile.kind === 'GENERIC'
+                                ) {
+                                  return null;
+                                }
+                                return (
+                                  <span className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                                    datasetProfile.model === 'ADAM'
+                                      ? 'border border-indigo-200 bg-indigo-50 text-indigo-700'
+                                      : 'border border-slate-200 bg-slate-100 text-slate-600'
+                                  }`}>
+                                    {datasetProfile.shortLabel}
+                                  </span>
+                                );
+                              })()}
+                            </div>
                         </div>
                     </div>
                     <div className="flex items-center space-x-2">
@@ -1034,7 +1193,7 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
                               <h4 className="font-semibold text-slate-800">Detected Issues</h4>
                               {selectedQCFile.qcIssues && selectedQCFile.qcIssues.length > 0 && (
                                   <button onClick={toggleSelectAll} type="button" className="text-xs text-medical-600 font-medium hover:underline">
-                                      {selectedIssueIndices.size === selectedQCFile.qcIssues.filter(isIssueAutoFixable).length ? 'Deselect All' : 'Select All'}
+                                      {selectedIssueIndices.size === selectedQCFile.qcIssues.filter((issue) => isIssueAutoFixable(issue) || isIssueAcknowledgeable(issue)).length ? 'Deselect All' : 'Select All'}
                                   </button>
                               )}
                           </div>
@@ -1044,24 +1203,26 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
                                   {selectedQCFile.qcIssues.map((issue, idx) => (
                                       (() => {
                                         const autoFixable = isIssueAutoFixable(issue);
+                                        const acknowledgeable = isIssueAcknowledgeable(issue);
+                                        const actionable = autoFixable || acknowledgeable;
                                         return (
                                       <div 
                                         key={idx} 
-                                        className={`flex items-start p-3 rounded border transition-colors ${autoFixable ? 'cursor-pointer' : 'cursor-not-allowed'} ${
+                                        className={`flex items-start p-3 rounded border transition-colors ${actionable ? 'cursor-pointer' : 'cursor-not-allowed'} ${
                                             selectedIssueIndices.has(idx)
                                               ? 'bg-blue-50 border-blue-200'
-                                              : autoFixable
-                                                ? 'bg-slate-50 border-slate-200 opacity-60 hover:opacity-100'
+                                              : actionable
+                                                ? 'bg-slate-50 border-slate-200 opacity-70 hover:opacity-100'
                                                 : 'bg-amber-50 border-amber-200 opacity-80'
                                         }`}
                                         onClick={() => {
-                                          if (autoFixable) toggleIssueSelection(idx);
+                                          if (actionable) toggleIssueSelection(idx);
                                         }}
                                       >
                                           <div className="mr-3 pt-0.5">
-                                              {selectedIssueIndices.has(idx) && autoFixable
+                                              {selectedIssueIndices.has(idx) && actionable
                                                 ? <CheckSquare className="w-5 h-5 text-medical-600" />
-                                                : <Square className={`w-5 h-5 ${autoFixable ? 'text-slate-400' : 'text-amber-500'}`} />
+                                                : <Square className={`w-5 h-5 ${actionable ? 'text-slate-400' : 'text-amber-500'}`} />
                                               }
                                           </div>
                                           <span className={`text-xs font-bold px-2 py-0.5 rounded uppercase mr-3 mt-0.5 h-fit ${
@@ -1077,7 +1238,9 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
                                               </p>
                                               {!autoFixable && (
                                                   <p className="text-xs text-amber-700 mt-1 font-medium">
-                                                      Manual fix required. {issue.remediationHint || 'Auto-fix is disabled for this issue type.'}
+                                                      {acknowledgeable
+                                                        ? `Review required. ${issue.remediationHint || 'You can acknowledge this advisory warning after review.'}`
+                                                        : `Manual fix required. ${issue.remediationHint || 'Auto-fix is disabled for this issue type.'}`}
                                                   </p>
                                               )}
                                               {issue.affectedRows && (
@@ -1144,19 +1307,34 @@ export const Ingestion: React.FC<IngestionProps> = ({ files, onAddFile, onRemove
                           </button>
                           
                           {selectedQCFile.qcStatus !== 'PASS' && !cleaningProposal && (
-                            <button 
-                                onClick={handleGenerateFix}
-                                type="button"
-                                disabled={isFixing || selectedIssueIndices.size === 0}
-                                className={`px-4 py-2 text-white rounded-lg font-medium transition-colors flex items-center shadow-sm ${
-                                    isFixing || selectedIssueIndices.size === 0 
-                                    ? 'bg-medical-400 cursor-not-allowed opacity-70' 
-                                    : 'bg-medical-600 hover:bg-medical-700'
-                                }`}
-                            >
-                                {isFixing ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Sparkles className="w-4 h-4 mr-2" />}
-                                {isFixing ? 'Generating Plan...' : `Fix Selected (${selectedIssueIndices.size})`}
-                            </button>
+                            <>
+                              <button
+                                  onClick={handleAcknowledgeSelected}
+                                  type="button"
+                                  disabled={selectedAcknowledgeableIssues.length === 0}
+                                  className={`px-4 py-2 rounded-lg font-medium transition-colors flex items-center shadow-sm ${
+                                      selectedAcknowledgeableIssues.length === 0
+                                      ? 'bg-slate-200 text-slate-500 cursor-not-allowed'
+                                      : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50'
+                                  }`}
+                              >
+                                  <CheckCircle className="w-4 h-4 mr-2" />
+                                  {`Acknowledge Selected (${selectedAcknowledgeableIssues.length})`}
+                              </button>
+                              <button 
+                                  onClick={handleGenerateFix}
+                                  type="button"
+                                  disabled={isFixing || selectedAutoFixableIssues.length === 0}
+                                  className={`px-4 py-2 text-white rounded-lg font-medium transition-colors flex items-center shadow-sm ${
+                                      isFixing || selectedAutoFixableIssues.length === 0
+                                      ? 'bg-medical-400 cursor-not-allowed opacity-70' 
+                                      : 'bg-medical-600 hover:bg-medical-700'
+                                  }`}
+                              >
+                                  {isFixing ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Sparkles className="w-4 h-4 mr-2" />}
+                                  {isFixing ? 'Generating Plan...' : `Fix Selected (${selectedAutoFixableIssues.length})`}
+                              </button>
+                            </>
                           )}
 
                           {cleaningProposal && (

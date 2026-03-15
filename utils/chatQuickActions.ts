@@ -1,5 +1,5 @@
-import { ClinicalFile, DataType } from '../types';
-import { parseCsv } from './dataProcessing';
+import { ClinicalFile } from '../types';
+import { inferDatasetProfile } from './datasetProfile';
 
 export type ChatQuickActionIcon =
   | 'OVERVIEW'
@@ -9,7 +9,8 @@ export type ChatQuickActionIcon =
   | 'EXPOSURE'
   | 'BIOMARKER'
   | 'LINKED'
-  | 'DEMOGRAPHICS';
+  | 'DEMOGRAPHICS'
+  | 'TIME_TO_EVENT';
 
 export interface ChatQuickAction {
   id: string;
@@ -18,51 +19,19 @@ export interface ChatQuickAction {
   icon: ChatQuickActionIcon;
 }
 
-type DatasetKind =
-  | 'DOCUMENT'
-  | 'DEMOGRAPHICS'
-  | 'ADVERSE_EVENTS'
-  | 'LABS'
-  | 'EXPOSURE'
-  | 'MOLECULAR'
-  | 'TUMOR'
-  | 'GENERIC';
-
-const normalize = (value: string) => value.trim().toLowerCase();
-
-const inferDatasetKind = (file: ClinicalFile): DatasetKind => {
-  const name = normalize(file.name);
-  if (file.type === DataType.DOCUMENT) return 'DOCUMENT';
-
-  let headers: string[] = [];
-  if (file.content) {
-    try {
-      headers = parseCsv(file.content).headers.map(normalize);
-    } catch {
-      headers = [];
-    }
-  }
-
-  const hasAnyHeader = (...candidates: string[]) => candidates.some((candidate) => headers.includes(normalize(candidate)));
-
-  if (/demo|demograph|\bdm\b/.test(name) || hasAnyHeader('age', 'sex', 'race', 'trt_arm', 'arm')) return 'DEMOGRAPHICS';
-  if (/adverse|\bae\b/.test(name) || hasAnyHeader('serious', 'relatedness', 'aeterm', 'aedecod', 'pt')) return 'ADVERSE_EVENTS';
-  if (/lab|\blb\b/.test(name) || hasAnyHeader('test', 'testcd', 'result', 'unit', 'lbdtc')) return 'LABS';
-  if (/exposure|dose|therapy/.test(name) || hasAnyHeader('drug', 'dose', 'doseu', 'therapy_class', 'exstdtc')) return 'EXPOSURE';
-  if (/molecular|genom|ngs|biomarker|pdl1|egfr|alk|ros1/.test(name) || hasAnyHeader('ngs_platform', 'pdl1_cat', 'biomarker')) return 'MOLECULAR';
-  if (/tumor|recist|response|outcome/.test(name) || hasAnyHeader('visit_response', 'best_response', 'assessment_date', 'asstdt')) return 'TUMOR';
-  return 'GENERIC';
-};
-
 export const buildChatQuickActions = (selectedFiles: ClinicalFile[], allFiles: ClinicalFile[] = []): ChatQuickAction[] => {
   const contextFiles = selectedFiles.length > 0 ? selectedFiles : allFiles;
-  const selectedKinds = new Set(contextFiles.map(inferDatasetKind));
-  const hasDocuments = contextFiles.some((file) => inferDatasetKind(file) === 'DOCUMENT');
-  const hasDemographics = selectedKinds.has('DEMOGRAPHICS');
-  const hasAe = selectedKinds.has('ADVERSE_EVENTS');
-  const hasLabs = selectedKinds.has('LABS');
+  const profiles = contextFiles.map((file) => inferDatasetProfile(file));
+  const selectedKinds = new Set(profiles.map((profile) => profile.kind));
+  const hasDocuments = profiles.some((profile) => profile.kind === 'DOCUMENT');
+  const hasDemographics = selectedKinds.has('DEMOGRAPHICS') || selectedKinds.has('ADSL');
+  const hasAe = selectedKinds.has('ADVERSE_EVENTS') || selectedKinds.has('ADAE');
+  const hasLabs = selectedKinds.has('LABS') || selectedKinds.has('ADLB') || selectedKinds.has('BDS');
   const hasExposure = selectedKinds.has('EXPOSURE');
   const hasMolecular = selectedKinds.has('MOLECULAR');
+  const hasAdsl = selectedKinds.has('ADSL');
+  const hasParameterisedAdam = selectedKinds.has('ADLB') || selectedKinds.has('BDS');
+  const hasAdtte = selectedKinds.has('ADTTE');
   const nonDocumentKinds = Array.from(selectedKinds).filter((kind) => kind !== 'DOCUMENT' && kind !== 'GENERIC');
   const actions: ChatQuickAction[] = [];
 
@@ -72,8 +41,8 @@ export const buildChatQuickActions = (selectedFiles: ClinicalFile[], allFiles: C
     icon: 'OVERVIEW',
     prompt:
       selectedFiles.length > 0
-        ? 'Review the selected sources and tell me which analyses are realistic, which workflow I should use next (AI Chat, Autopilot, or Statistical Analysis), and any obvious data gaps or risks before analysis.'
-        : 'I have not selected any sources yet. Tell me what kinds of files I should pick for demographic review, safety review, and protocol-driven analysis, and explain when to use AI Chat, Autopilot, or Statistical Analysis.',
+        ? 'Review the selected sources and tell me which analyses are realistic, which workflow I should use next (AI Chat, Autopilot, or Statistical Analysis), and any obvious data gaps, ADaM guardrails, or risks before analysis.'
+        : 'I have not selected any sources yet. Tell me which files I should pick first for ingestion review, analysis-ready datasets, and protocol-driven work, and explain when to use AI Chat, Autopilot, or Statistical Analysis.',
   });
 
   if (hasDocuments) {
@@ -83,6 +52,36 @@ export const buildChatQuickActions = (selectedFiles: ClinicalFile[], allFiles: C
       icon: 'PROTOCOL',
       prompt:
         'Summarize the key endpoints, populations, and analysis expectations from the selected protocol or SAP documents, then explain whether the selected datasets can support them and what is still missing.',
+    });
+  }
+
+  if (hasAdsl) {
+    actions.push({
+      id: 'analysis-set',
+      label: 'Analysis set review',
+      icon: 'DEMOGRAPHICS',
+      prompt:
+        'Review the selected ADSL or subject-level analysis datasets. Confirm treatment variables, population flags, and subject counts, and explain whether the dataset is ready for controlled statistical analysis.',
+    });
+  }
+
+  if (hasParameterisedAdam) {
+    actions.push({
+      id: 'parameter-review',
+      label: 'Parameter review',
+      icon: 'LABS',
+      prompt:
+        'Review the selected ADaM parameterised datasets. Summarize PARAM/PARAMCD coverage, identify whether multiple parameters are mixed together, and explain what should be filtered before inferential analysis.',
+    });
+  }
+
+  if (hasAdtte) {
+    actions.push({
+      id: 'time-to-event',
+      label: 'Time-to-event review',
+      icon: 'TIME_TO_EVENT',
+      prompt:
+        'Review the selected ADTTE or time-to-event datasets. Explain the endpoint variables, censoring structure, and whether the selected file is ready for a lightweight exploratory Kaplan-Meier run in AI Chat or should be opened in Statistical Analysis for a controlled survival workflow.',
     });
   }
 
@@ -96,7 +95,7 @@ export const buildChatQuickActions = (selectedFiles: ClinicalFile[], allFiles: C
     });
   }
 
-  if (hasLabs) {
+  if (hasLabs && !hasParameterisedAdam) {
     actions.push({
       id: 'labs',
       label: 'Lab anomalies',
@@ -126,13 +125,13 @@ export const buildChatQuickActions = (selectedFiles: ClinicalFile[], allFiles: C
     });
   }
 
-  if (hasDemographics && !hasAe && !hasLabs && !hasExposure && !hasMolecular) {
+  if (hasDemographics && !hasAe && !hasLabs && !hasExposure && !hasMolecular && !hasAdtte) {
     actions.push({
       id: 'demographics',
       label: 'Baseline balance',
       icon: 'DEMOGRAPHICS',
       prompt:
-        'Summarize the selected demographics source, highlight baseline imbalances or unusual category distributions, and suggest the most meaningful next analyses.',
+        'Summarize the selected demographics or subject-level analysis source, highlight baseline imbalances or unusual category distributions, and suggest the most meaningful next analyses.',
     });
   }
 

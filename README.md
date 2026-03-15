@@ -16,6 +16,7 @@ This repository contains the current prototype application and the minimum backe
 - Integrated Node server for local development and simple deployment
 - Server-side AI proxy endpoint at `/api/ai/generate`
 - Server-side project persistence endpoint at `/api/projects`
+- Server-side SAS dataset parsing endpoint at `/api/ingestion/parse-sas`
 - Deterministic statistical execution engine in the app
 - Local disk-backed project persistence for POC use
 - Evidence CoPilot branding and report export
@@ -27,9 +28,11 @@ flowchart LR
     U["User Browser"] --> FE["React/Vite Frontend"]
     FE --> API["Node Backend /api/ai/generate"]
     FE --> PAPI["Node Backend /api/projects"]
+    FE --> SAPI["Node Backend /api/ingestion/parse-sas"]
     API --> LLM["LLM Provider"]
     PAPI --> META["Local Metadata Store (.app-data/projects.metadata.json)"]
     PAPI --> ART["Local File Artifact Store (.app-data/file-artifacts/)"]
+    SAPI --> PY["Python parser (pyreadstat)"]
     FE --> EXP["HTML Exports"]
 ```
 
@@ -37,6 +40,7 @@ Current implementation notes:
 - The frontend calls the backend for AI interactions.
 - The frontend also calls the backend for project persistence.
 - The backend currently uses Google Gemini in `server/index.js`.
+- SAS transport files (`.xpt`) and SAS datasets (`.sas7bdat`) are parsed server-side through Python `pyreadstat`.
 - Deterministic statistics are executed locally in app logic, not by the model.
 - Project metadata is currently stored on local disk through the backend metadata store.
 - File payloads are currently stored separately on local disk through the backend artifact store.
@@ -52,6 +56,7 @@ Current implementation notes:
 - backend-backed local project persistence
 - split local metadata and file-artifact persistence
 - ingestion, QC, mapping, Autopilot, Statistical Analysis, AI Chat
+- `.xpt` and `.sas7bdat` ingestion when the local Python parser dependency is installed
 - deterministic statistical execution
 - HTML report export
 - local-first prototype testing with no cloud dependency
@@ -93,6 +98,7 @@ These areas are prepared architecturally but not fully wired to real enterprise 
 | Backend API boundary | Working | Partial | Split integrated server into dedicated API/worker services and harden auth, validation, and rate controls |
 | AI provider boundary | Working | Partial | Replace provider implementation with Azure OpenAI GPT-5 backend and task-specific model routing |
 | Project persistence | Working locally | Partial | Move metadata to RDS/PostgreSQL and files/artifacts to S3 |
+| SAS/ADaM binary ingestion | Working locally | Partial | Containerize Python parser/runtime and decide whether to keep `pyreadstat` service-side or replace with a managed parsing service |
 | Authentication | POC open access | No | Integrate J&J sign-in and validate identity on every backend request |
 | Authorization | Frontend-only POC policy | No | Enforce claim/group-based authorization in backend APIs |
 | Analysis execution | Working | Partial | Add async jobs, central run manifests, and governed rerun semantics |
@@ -116,11 +122,25 @@ These areas are prepared architecturally but not fully wired to real enterprise 
 
 - Node.js 22.x recommended
 - npm 10+
+- Python 3.12+ recommended for SAS dataset ingestion (`.xpt`, `.sas7bdat`)
 
 ### Install
 
 ```bash
 npm install
+```
+
+Install the local Python parser dependencies if you want native `.xpt` or `.sas7bdat` ingestion:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+The backend automatically uses `.venv/bin/python3` if it exists. You can override it with:
+
+```bash
+ECP_PYTHON_BIN=/path/to/python3
 ```
 
 ### Local environment
@@ -161,6 +181,7 @@ A colleague can reproduce:
 - AI proxy pattern
 - backend-backed local persistence behavior
 - split metadata/file payload persistence behavior
+- `.xpt` / `.sas7bdat` ingestion if they also install the Python requirements
 - deterministic analytics behavior
 - export/report generation
 
@@ -183,6 +204,7 @@ POC characteristics:
 - everyone has full access in the app
 - auth is intentionally simplified
 - project data is stored in a local backend file store
+- SAS binary ingestion depends on a local Python runtime plus `pyreadstat`
 - some frontend dependencies are loaded from CDN in `index.html`
 - the backend is a lightweight integrated Node server
 

@@ -1,5 +1,6 @@
 import { AnalysisConcept, ClinicalFile, StatTestType } from '../types';
 import { parseCsv, toNumber } from './dataProcessing';
+import { inferDatasetProfile } from './datasetProfile';
 import { planAnalysisFromQuestion } from './queryPlanner';
 
 export interface AutopilotAnalysisTask {
@@ -20,6 +21,9 @@ const ID_HINTS = ['id', 'subjid', 'usubjid', 'subject', 'patient', 'record'];
 const GROUP_HINTS = ['arm', 'treatment', 'trt', 'group', 'cohort'];
 const DEMOGRAPHIC_CATEGORICAL_HINTS = ['sex', 'gender', 'race', 'ethnicity'];
 const AE_HINTS = ['aeterm', 'pt', 'serious', 'relatedness', 'action_taken', 'outcome', 'grade'];
+const PARAMETER_HINTS = ['paramcd', 'param'];
+const ANALYSIS_VALUE_HINTS = ['aval', 'chg', 'base'];
+const TIME_TO_EVENT_HINTS = ['aval', 'time', 'month', 'months', 'day', 'days', 'duration', 'tte', 'os', 'pfs'];
 
 const normalize = (value: string) => value.trim().toLowerCase();
 
@@ -61,6 +65,36 @@ const chooseNumericColumns = (headers: string[], rows: Record<string, string>[])
 const findHeader = (headers: string[], hints: string[]) =>
   headers.find((header) => hints.some((hint) => normalize(header).includes(normalize(hint)))) || null;
 
+const chooseTreatmentColumn = (headers: string[]): string | null =>
+  findHeader(headers, ['TRT01A', 'TRTA', 'TRT01P', 'TREATMENT_ARM', 'TRT_ARM', 'ACTARM', 'ARM']);
+
+const isPotentialTimeToEventColumn = (rows: Record<string, string>[], col: string): boolean => {
+  const sample = rows.slice(0, 300);
+  const nonEmpty = sample.map((row) => row[col]).filter((value) => value != null && value.trim() !== '');
+  if (nonEmpty.length === 0) return false;
+  const numericCount = nonEmpty.filter((value) => toNumber(value) != null).length;
+  return numericCount >= Math.max(1, Math.floor(nonEmpty.length * 0.75));
+};
+
+const chooseTimeToEventColumn = (headers: string[], rows: Record<string, string>[], exclude?: string): string | null => {
+  const numericCandidates = headers.filter(
+    (header) => header !== exclude && !isIdentifierColumn(rows, header) && isPotentialTimeToEventColumn(rows, header)
+  );
+
+  for (const hint of TIME_TO_EVENT_HINTS) {
+    const found = numericCandidates.find((header) => normalize(header).includes(hint));
+    if (found) return found;
+  }
+
+  return numericCandidates[0] || null;
+};
+
+const inferEndpointLabel = (rows: Record<string, string>[], parameterColumn: string | null): string | null => {
+  if (!parameterColumn) return null;
+  const values = Array.from(new Set(rows.map((row) => (row[parameterColumn] || '').trim()).filter(Boolean)));
+  return values.length === 1 ? values[0] : null;
+};
+
 export const buildAutopilotAnalysisSuite = (
   file: ClinicalFile,
   customSynonyms: string[] = []
@@ -68,7 +102,8 @@ export const buildAutopilotAnalysisSuite = (
   const { headers, rows } = parseCsv(file.content);
   if (headers.length === 0 || rows.length === 0) return [];
 
-  const groupCol = chooseGroupColumn(headers);
+  const datasetProfile = inferDatasetProfile(file);
+  const groupCol = chooseTreatmentColumn(headers) || chooseGroupColumn(headers);
   const numericColumns = chooseNumericColumns(headers, rows);
   const categoricalColumns = chooseCategoricalColumns(headers, rows);
   const tasks: AutopilotAnalysisTask[] = [];
@@ -78,6 +113,9 @@ export const buildAutopilotAnalysisSuite = (
   const outcomeColumn = findHeader(headers, ['OUTCOME']);
   const actionTakenColumn = findHeader(headers, ['ACTION_TAKEN', 'ACTION']);
   const gradeColumn = findHeader(headers, ['GRADE']);
+  const parameterColumn = findHeader(headers, PARAMETER_HINTS);
+  const analysisValueColumn = findHeader(headers, ANALYSIS_VALUE_HINTS) || numericColumns[0];
+  const censoringColumn = findHeader(headers, ['CNSR']);
 
   const addTask = (task: Omit<AutopilotAnalysisTask, 'id'>) => {
     const exists = tasks.some(
@@ -89,6 +127,93 @@ export const buildAutopilotAnalysisSuite = (
     if (exists) return;
     tasks.push({ id: crypto.randomUUID(), ...task });
   };
+
+  if (datasetProfile.kind === 'ADTTE') {
+    const distinctParameters = parameterColumn ? countDistinct(rows.map((row) => (row[parameterColumn] || '').trim())) : 0;
+    if (groupCol && parameterColumn && distinctParameters > 1) {
+      addTask({
+        label: `${parameterColumn} by ${groupCol}`,
+        question: 'Does endpoint coverage differ across treatment groups?',
+        testType: StatTestType.CHI_SQUARE,
+        var1: groupCol,
+        var2: parameterColumn,
+        rationale:
+          'This ADTTE dataset contains multiple time-to-event endpoints. Autopilot avoids pooling them together and instead reviews endpoint coverage by group until the file is filtered to one PARAM/PARAMCD.',
+      });
+      return tasks;
+    }
+
+    const timeColumn = chooseTimeToEventColumn(headers, rows, groupCol || undefined);
+    const endpointLabel = inferEndpointLabel(rows, parameterColumn) || 'time-to-event outcome';
+
+    if (groupCol && timeColumn && censoringColumn) {
+      addTask({
+        label: `${endpointLabel} by ${groupCol}`,
+        question: `Does ${endpointLabel.toLowerCase()} differ between treatment groups?`,
+        testType: StatTestType.KAPLAN_MEIER,
+        var1: groupCol,
+        var2: timeColumn,
+        rationale:
+          'ADTTE was recognized. Run Kaplan-Meier curves and a log-rank comparison using the time-to-event variable and the detected censoring column.',
+      });
+
+      const distinctGroups = countDistinct(rows.map((row) => (row[groupCol] || '').trim()));
+      if (distinctGroups === 2) {
+        addTask({
+          label: `Hazard ratio for ${endpointLabel}`,
+          question: `What is the hazard ratio for ${endpointLabel.toLowerCase()} by treatment group?`,
+          testType: StatTestType.COX_PH,
+          var1: groupCol,
+          var2: timeColumn,
+          rationale:
+            'A two-group ADTTE dataset was recognized. Estimate a simple Cox proportional hazards model using treatment as the covariate.',
+        });
+      }
+    } else if (groupCol && censoringColumn) {
+      addTask({
+        label: `${censoringColumn} by ${groupCol}`,
+        question: 'Does the censoring pattern differ across treatment groups?',
+        testType: StatTestType.CHI_SQUARE,
+        var1: groupCol,
+        var2: censoringColumn,
+        rationale:
+          'Censoring can be reviewed, but a usable time-to-event variable was not found automatically. Confirm the endpoint time column before formal survival analysis.',
+      });
+    }
+    return tasks;
+  }
+
+  if (datasetProfile.kind === 'ADLB' || datasetProfile.kind === 'BDS') {
+    const distinctParameters = parameterColumn ? countDistinct(rows.map((row) => (row[parameterColumn] || '').trim())) : 0;
+    if (groupCol && parameterColumn && distinctParameters > 1) {
+      addTask({
+        label: `${parameterColumn} by ${groupCol}`,
+        question: 'Does parameter coverage differ across treatment groups?',
+        testType: StatTestType.CHI_SQUARE,
+        var1: groupCol,
+        var2: parameterColumn,
+        rationale:
+          'This ADaM dataset contains multiple parameters. Autopilot avoids pooling AVAL across parameters and instead reviews parameter coverage by group.',
+      });
+      return tasks;
+    }
+
+    if (groupCol && analysisValueColumn) {
+      const groupDistinct = countDistinct(rows.map((row) => (row[groupCol] || '').trim()));
+      addTask({
+        label: `${analysisValueColumn} by ${groupCol}`,
+        question: `Does ${analysisValueColumn.toLowerCase()} differ across ${groupCol.toLowerCase()} groups?`,
+        testType: groupDistinct === 2 ? StatTestType.T_TEST : StatTestType.ANOVA,
+        var1: groupCol,
+        var2: analysisValueColumn,
+        rationale:
+          distinctParameters > 1
+            ? 'This analysis is only safe if the dataset has already been filtered to a single parameter. Review PARAM/PARAMCD before relying on it.'
+            : 'Single-parameter ADaM dataset detected. Compare the analysis value across groups.',
+      });
+      return tasks;
+    }
+  }
 
   if (groupCol) {
     const groupDistinct = countDistinct(rows.map((row) => (row[groupCol] || '').trim()));

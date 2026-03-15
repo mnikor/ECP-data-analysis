@@ -1,5 +1,6 @@
 import { AnalysisConcept, ClinicalFile, StatTestType } from '../types';
 import { CsvRow, parseCsv, toNumber } from './dataProcessing';
+import { inferDatasetProfile } from './datasetProfile';
 
 export interface PlannedAnalysis {
   testType: StatTestType;
@@ -12,6 +13,8 @@ export interface PlannedAnalysis {
 const EVENT_COLUMN_HINTS = ['aeterm', 'adverse', 'event', 'meddra', 'reaction', 'symptom', 'diagnosis'];
 const GROUP_COLUMN_HINTS = ['arm', 'treatment', 'trt', 'group', 'cohort', 'sex', 'race', 'site'];
 const IDENTIFIER_COLUMN_HINTS = ['id', 'subjid', 'usubjid', 'subject', 'patient', 'record'];
+const TIME_TO_EVENT_HINTS = ['aval', 'time', 'month', 'months', 'day', 'days', 'duration', 'tte', 'os', 'pfs'];
+const SURVIVAL_QUERY_HINTS = /survival|overall survival|progression[- ]free|pfs|os\b|time[- ]to[- ]event|time to event|kaplan|log[- ]rank|cox|hazard/i;
 
 const CLINICAL_CONCEPTS: Record<string, { triggers: string[]; synonyms: string[] }> = {
   skin_rash: {
@@ -84,6 +87,27 @@ const chooseCategoricalOutcomeColumn = (headers: string[], rows: CsvRow[], exclu
     .filter((x) => x.distinct >= 2 && x.distinct <= 12)
     .sort((a, b) => a.distinct - b.distinct);
   return candidates[0]?.h || null;
+};
+
+const isPotentialTimeToEventColumn = (rows: CsvRow[], col: string): boolean => {
+  const sample = rows.slice(0, 300);
+  const nonEmpty = sample.map((row) => row[col]).filter((value) => value != null && value.trim() !== '');
+  if (nonEmpty.length === 0) return false;
+  const numericCount = nonEmpty.filter((value) => toNumber(value) != null).length;
+  return numericCount >= Math.max(1, Math.floor(nonEmpty.length * 0.75));
+};
+
+const chooseTimeToEventColumn = (headers: string[], rows: CsvRow[], exclude: string): string | null => {
+  const numericCandidates = headers.filter(
+    (h) => h !== exclude && !isLikelyIdentifierColumn(rows, h) && isPotentialTimeToEventColumn(rows, h)
+  );
+
+  for (const hint of TIME_TO_EVENT_HINTS) {
+    const found = numericCandidates.find((header) => header.toLowerCase().includes(hint));
+    if (found) return found;
+  }
+
+  return numericCandidates[0] || null;
 };
 
 const detectClinicalConcept = (
@@ -184,6 +208,63 @@ export const planAnalysisFromQuestion = (
   const { headers, rows } = parseCsv(file.content);
   if (headers.length === 0 || rows.length === 0) {
     throw new Error('Selected dataset has no parsable rows.');
+  }
+
+  const datasetProfile = inferDatasetProfile(file);
+  const queryLower = query.toLowerCase();
+  const parameterColumn = headers.find((header) => ['param', 'paramcd'].some((hint) => header.toLowerCase().includes(hint))) || null;
+  const parameterCount = parameterColumn ? countDistinct(rows, parameterColumn) : 0;
+
+  if ((datasetProfile.kind === 'ADTTE' || SURVIVAL_QUERY_HINTS.test(queryLower)) && parameterColumn && parameterCount > 1) {
+    throw new Error(
+      'This time-to-event dataset contains multiple PARAM/PARAMCD endpoints. Filter to a single endpoint before running Kaplan-Meier or Cox analysis.'
+    );
+  }
+
+  if (datasetProfile.kind === 'ADTTE' || SURVIVAL_QUERY_HINTS.test(queryLower)) {
+    const groupVar = chooseGroupColumn(headers, rows) || headers.find((header) => !isLikelyIdentifierColumn(rows, header)) || headers[0];
+    const timeVar = chooseTimeToEventColumn(headers, rows, groupVar);
+
+    if (!groupVar || !timeVar) {
+      throw new Error('A survival analysis requires a grouping/covariate column and a numeric time-to-event column.');
+    }
+
+    const survivalTestType = /cox|hazard/i.test(queryLower)
+      ? StatTestType.COX_PH
+      : StatTestType.KAPLAN_MEIER;
+
+    return {
+      testType: survivalTestType,
+      var1: groupVar,
+      var2: timeVar,
+      explanation:
+        survivalTestType === StatTestType.COX_PH
+          ? `Interpreted this as a Cox proportional hazards analysis. Will model time-to-event using ${timeVar} with ${groupVar} as the primary covariate/grouping variable.`
+          : `Interpreted this as a time-to-event analysis. Will run Kaplan-Meier curves with a log-rank comparison using ${timeVar} and ${groupVar}.`,
+      concept: null,
+    };
+  }
+
+  if ((datasetProfile.kind === 'ADLB' || datasetProfile.kind === 'BDS') && parameterColumn && parameterCount > 1) {
+    const treatmentColumn = headers.find((header) =>
+      ['trt01a', 'trta', 'trt01p', 'treatment', 'arm', 'trt_arm', 'actarm'].some((hint) =>
+        header.toLowerCase().includes(hint)
+      )
+    );
+    if (treatmentColumn) {
+      return {
+        testType: StatTestType.CHI_SQUARE,
+        var1: treatmentColumn,
+        var2: parameterColumn,
+        explanation:
+          'This ADaM dataset contains multiple parameters. The app cannot safely pool analysis values across parameters in one step, so it falls back to parameter coverage by treatment. Filter to a single PARAM/PARAMCD before running inferential comparisons.',
+        concept: null,
+      };
+    }
+
+    throw new Error(
+      'This ADaM dataset contains multiple parameters and no clear treatment grouping variable. Filter to one PARAM/PARAMCD and confirm the intended analysis set before running inferential analysis.'
+    );
   }
 
   const concept = detectClinicalConcept(query, headers, rows, customSynonyms);

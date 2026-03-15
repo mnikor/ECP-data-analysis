@@ -1,6 +1,9 @@
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadEnv, createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
@@ -65,6 +68,102 @@ const sendJson = (res, statusCode, payload) => {
     'Cache-Control': 'no-store',
   });
   res.end(JSON.stringify(payload));
+};
+
+const resolvePythonBinary = () => {
+  if (process.env.ECP_PYTHON_BIN) return process.env.ECP_PYTHON_BIN;
+
+  const venvPython = path.join(root, '.venv', 'bin', 'python3');
+  if (fsSync.existsSync(venvPython)) return venvPython;
+
+  return 'python3';
+};
+
+const runPythonParser = (filePath) =>
+  new Promise((resolve, reject) => {
+    const scriptPath = path.join(__dirname, 'parse_sas.py');
+    const child = spawn(resolvePythonBinary(), [scriptPath, filePath], {
+      cwd: root,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+
+    child.on('error', (error) => {
+      reject(error);
+    });
+
+    child.on('close', (code) => {
+      let parsed = null;
+      try {
+        parsed = stdout ? JSON.parse(stdout) : null;
+      } catch {
+        parsed = null;
+      }
+
+      if (code === 0 && parsed && !parsed.error) {
+        resolve(parsed);
+        return;
+      }
+
+      const errorMessage =
+        parsed?.error ||
+        stderr.trim() ||
+        stdout.trim() ||
+        'Failed to parse SAS dataset.';
+      reject(new Error(errorMessage));
+    });
+  });
+
+const handleSasParse = async (req, res) => {
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { error: 'Method not allowed' });
+    return;
+  }
+
+  let tempPath = null;
+
+  try {
+    const body = await readJsonBody(req);
+    const fileName = typeof body.fileName === 'string' ? body.fileName : '';
+    const base64Data = typeof body.base64Data === 'string' ? body.base64Data : '';
+    const extension = path.extname(fileName).toLowerCase();
+
+    if (!fileName || !base64Data) {
+      sendJson(res, 400, { error: 'fileName and base64Data are required.' });
+      return;
+    }
+
+    if (!['.xpt', '.sas7bdat'].includes(extension)) {
+      sendJson(res, 400, { error: 'Only .xpt and .sas7bdat files are supported.' });
+      return;
+    }
+
+    const buffer = Buffer.from(base64Data, 'base64');
+    tempPath = path.join(os.tmpdir(), `evidence-copilot-${crypto.randomUUID()}${extension}`);
+    await fs.writeFile(tempPath, buffer);
+
+    const parsed = await runPythonParser(tempPath);
+    sendJson(res, 200, parsed);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to parse SAS dataset.';
+    console.error('SAS parse error', error);
+    sendJson(res, 500, { error: message });
+  } finally {
+    if (tempPath) {
+      await fs.rm(tempPath, { force: true }).catch(() => {});
+    }
+  }
 };
 
 const handleAiGenerate = async (req, res) => {
@@ -234,6 +333,11 @@ const start = async () => {
 
     if (url.pathname === '/api/ai/generate') {
       await handleAiGenerate(req, res);
+      return;
+    }
+
+    if (url.pathname === '/api/ingestion/parse-sas') {
+      await handleSasParse(req, res);
       return;
     }
 
